@@ -8,22 +8,25 @@ app = typer.Typer(no_args_is_help=True)
 
 @app.command()
 def run(
-    step: str = typer.Option("all", help="scope|subdomains|probe|content|all"),
+    step: str = typer.Option("all", help="scope|subdomains|probe|fingerprint|content|all"),
     program: Optional[str] = typer.Option(None, help="HackerOne team/program name"),
     all: bool = typer.Option(False, help="Run without program scoping"),
     interactive: bool = typer.Option(False, help="Allow interactive prompts (fallback)"),
     max_parallel: int = typer.Option(5, help="Parallelism for subdomain enum"),
     batch_size: int = typer.Option(500, help="Batch size for httpx probing"),
+    fp_batch_size: int = typer.Option(300, help="Batch size for httpx -tech-detect"),
 ):
     from recon.pipeline.scope import run_scope_download
     from recon.pipeline.subdomains import run_subdomain_enum
     from recon.pipeline.probe import run_asset_probing
+    from recon.pipeline.fingerprint import run_fingerprinting
     from recon.pipeline.content import run_content_discovery
 
     if step == "all":
         run_scope_download(program=program, run_all=all, interactive=interactive)
         run_subdomain_enum(program=program, run_all=all, max_parallel=max_parallel)
         run_asset_probing(program=program, run_all=all, batch_size=batch_size)
+        run_fingerprinting(program=program, run_all=all, batch_size=fp_batch_size)
         run_content_discovery(program=program, run_all=all)
         return
 
@@ -33,10 +36,12 @@ def run(
         run_subdomain_enum(program=program, run_all=all, max_parallel=max_parallel)
     elif step == "probe":
         run_asset_probing(program=program, run_all=all, batch_size=batch_size)
+    elif step == "fingerprint":
+        run_fingerprinting(program=program, run_all=all, batch_size=fp_batch_size)
     elif step == "content":
         run_content_discovery(program=program, run_all=all)
     else:
-        raise typer.BadParameter("Invalid step. Use scope|subdomains|probe|content|all")
+        raise typer.BadParameter("Invalid step. Use scope|subdomains|probe|fingerprint|content|all")
 
 
 @app.command()

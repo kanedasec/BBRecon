@@ -83,7 +83,7 @@ class Service(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
-    
+
     url: Mapped[str] = mapped_column(String(2048), unique=True, index=True)
     fqdn: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     scheme: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
@@ -103,14 +103,37 @@ class Service(Base):
     def __repr__(self) -> str:
         return f"<Service url={self.url}>"
 
+
 class DiscoveredURL(Base):
     __tablename__ = "discovered_urls"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
-    
+
     url: Mapped[str] = mapped_column(String(2048), unique=True, index=True)
     source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     service_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True, index=True)
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class Fingerprint(Base):
+    __tablename__ = "fingerprints"
+    __table_args__ = (
+        UniqueConstraint("service_url", "tech", name="uq_fingerprint_service_tech"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
+
+    service_url: Mapped[str] = mapped_column(String(2048), index=True)
+    tech: Mapped[str] = mapped_column(String(120), index=True)
+
+    source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    def __repr__(self) -> str:
+        return f"<Fingerprint tech={self.tech} service_url={self.service_url}>"

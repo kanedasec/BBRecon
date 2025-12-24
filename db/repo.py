@@ -1,9 +1,21 @@
 from __future__ import annotations
+
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Optional, Sequence
+
 from sqlalchemy import select
-from .models import Run, Program, ScopeDomain, Subdomain, Service, DiscoveredURL
+from sqlalchemy.exc import IntegrityError
+
+from .models import (
+    Run,
+    Program,
+    ScopeDomain,
+    Subdomain,
+    Service,
+    DiscoveredURL,
+    Fingerprint,
+)
 
 
 def utcnow() -> datetime:
@@ -25,7 +37,7 @@ class ReconRepo:
     def start_run(self, step: str, meta: Optional[dict] = None) -> int:
         r = Run(step=step, meta_json=json.dumps(meta or {}, ensure_ascii=False))
         self.session.add(r)
-        self.session.flush()  
+        self.session.flush()
         return r.id
 
     def finish_run(self, run_id: int) -> None:
@@ -60,7 +72,6 @@ class ReconRepo:
         if not cleaned:
             return 0
 
-        # fetch existing scope domains for this program
         existing_rows = self.session.execute(
             select(ScopeDomain.domain).where(
                 ScopeDomain.program_id == p.id,
@@ -80,7 +91,6 @@ class ReconRepo:
                 )
             )
 
-        # update last_seen for all seen this run
         if cleaned:
             rows = self.session.execute(
                 select(ScopeDomain).where(
@@ -110,13 +120,11 @@ class ReconRepo:
         if not cleaned:
             return 0
 
-        # Resolve program_id if program provided
         pid: int | None = None
         if program:
             p = self.get_or_create_program(program)
             pid = p.id
 
-        # Pre-fetch existing FQDNs (fast path)
         existing_rows = self.session.execute(
             select(Subdomain.fqdn).where(Subdomain.fqdn.in_(cleaned))
         ).scalars().all()
@@ -125,7 +133,6 @@ class ReconRepo:
         new_items = [fqdn for fqdn in cleaned if fqdn not in existing_set]
         new_count = 0
 
-        # Insert new items one-by-one with flush to avoid deferred UNIQUE surprises
         for fqdn in new_items:
             try:
                 self.session.add(
@@ -137,12 +144,10 @@ class ReconRepo:
                         last_seen=now,
                     )
                 )
-                self.session.flush()  # forces INSERT now, catches UNIQUE immediately
+                self.session.flush()
                 new_count += 1
 
             except IntegrityError:
-                # Another insert already won (or fqdn exists but wasn't in our existing_set).
-                # Rollback current failed INSERT and upsert as update.
                 self.session.rollback()
 
                 row = self.session.execute(
@@ -158,7 +163,6 @@ class ReconRepo:
                 self.session.add(row)
                 self.session.flush()
 
-        # Touch last_seen (and fill missing fields) for ALL cleaned fqdn seen now
         rows = self.session.execute(
             select(Subdomain).where(Subdomain.fqdn.in_(cleaned))
         ).scalars().all()
@@ -174,9 +178,6 @@ class ReconRepo:
         return new_count
 
     def list_scope_domains(self, program: str | None = None) -> list[str]:
-        """
-        Returns scope domains. If program is None, returns all scope domains across programs.
-        """
         q = select(ScopeDomain.domain)
 
         if program:
@@ -186,7 +187,6 @@ class ReconRepo:
             q = q.where(ScopeDomain.program_id == p.id)
 
         rows = self.session.execute(q).scalars().all()
-        # dedupe + stable output
         return sorted(set(rows))
 
     def list_subdomains(self, root_domain=None, only_recent_days=None):
@@ -201,7 +201,7 @@ class ReconRepo:
             rows = [r for r in rows if r.last_seen and r.last_seen >= cutoff]
 
         return sorted(set(r.fqdn for r in rows))
-    
+
     def list_subdomains_for_root_domains(self, root_domains: Sequence[str], only_new_after: datetime | None = None) -> list[str]:
         roots = sorted({normalize_domain(d) for d in (root_domains or []) if normalize_domain(d)})
         if not roots:
@@ -214,12 +214,7 @@ class ReconRepo:
         rows = self.session.execute(q).scalars().all()
         return sorted(set(rows))
 
-
     def get_last_finished_run_time(self, step: str) -> datetime | None:
-        """
-        Returns the started_at of the most recent finished run for `step`.
-        Using started_at is usually enough; you can switch to finished_at if you prefer.
-        """
         row = self.session.execute(
             select(Run)
             .where(Run.step == step)
@@ -231,16 +226,13 @@ class ReconRepo:
         return row.finished_at if row else None
 
     def list_subdomains_first_seen_after(self, dt: datetime) -> list[str]:
-        """
-        Returns subdomains that are NEW since `dt` (based on first_seen).
-        """
         rows = self.session.execute(
             select(Subdomain.fqdn)
             .where(Subdomain.first_seen > dt)
         ).scalars().all()
 
         return sorted(set(rows))
-    
+
     def list_new_subdomains_since(self, dt: datetime, root_domains: list[str] | None = None) -> list[str]:
         q = select(Subdomain.fqdn).where(Subdomain.first_seen > dt)
         if root_domains:
@@ -248,15 +240,10 @@ class ReconRepo:
         rows = self.session.execute(q).scalars().all()
         return sorted(set(rows))
 
-
     # ----------------------
     # Services (httpx)
     # ----------------------
     def upsert_services(self, httpx_results: Sequence[dict]) -> int:
-        """
-        Expects list[dict] from httpx -json output.
-        Uses `url` as unique key.
-        """
         now = utcnow()
         normalized: list[dict] = []
         for r in httpx_results or []:
@@ -282,7 +269,6 @@ class ReconRepo:
                 continue
 
             if url not in existing_set:
-                # insert new
                 svc = Service(
                     url=url,
                     fqdn=normalize_domain(str(r.get("input") or r.get("host") or "")) or None,
@@ -300,10 +286,8 @@ class ReconRepo:
                 self.session.add(svc)
                 new_count += 1
             else:
-                # update existing
                 svc = self.session.execute(select(Service).where(Service.url == url)).scalar_one()
                 svc.last_seen = now
-                # keep latest known metadata (optional)
                 svc.title = r.get("title") or svc.title
                 svc.webserver = r.get("webserver") or svc.webserver
                 svc.content_type = r.get("content_type") or svc.content_type
@@ -311,19 +295,18 @@ class ReconRepo:
                 self.session.add(svc)
 
         return new_count
-    
+
     def list_service_urls(self, status_code: int = 200) -> list[str]:
         rows = self.session.execute(
             select(Service.url).where(Service.status_code == status_code)
         ).scalars().all()
         return sorted(set(rows))
-    
+
     def list_service_urls_scoped(self, scope_domains: Sequence[str], status_code: int = 200) -> list[str]:
         roots = sorted({normalize_domain(d) for d in (scope_domains or []) if normalize_domain(d)})
         if not roots:
             return []
 
-        # Pull subdomains under these roots
         sub_rows = self.session.execute(
             select(Subdomain.fqdn).where(Subdomain.root_domain.in_(roots))
         ).scalars().all()
@@ -337,20 +320,86 @@ class ReconRepo:
             .where(Service.fqdn.in_(sub_set))
         ).scalars().all()
         return sorted(set(rows))
-    
+
     def list_new_services_since(self, dt: datetime, fqdn_list: list[str] | None = None) -> list[tuple[str, int | None]]:
         q = select(Service.url, Service.status_code).where(Service.first_seen > dt)
         if fqdn_list:
             q = q.where(Service.fqdn.in_(fqdn_list))
         rows = self.session.execute(q).all()
-        # returns list of (url, status_code)
         return sorted(set(rows))
 
+    # ----------------------
+    # NEW: Fingerprinting
+    # ----------------------
+    def list_services_for_fingerprinting(
+        self,
+        only_new_after: datetime | None = None,
+        status_codes: Sequence[int] = (200, 301, 302, 401, 403),
+    ) -> list[str]:
+        q = select(Service.url).where(Service.status_code.in_(list(status_codes)))
+        if only_new_after is not None:
+            q = q.where(Service.first_seen > only_new_after)
+        rows = self.session.execute(q).scalars().all()
+        return sorted(set(rows))
+
+    def upsert_fingerprints(self, items: list[dict]) -> int:
+        """
+        items: [{"service_url": "...", "tech": "nginx", "source":"httpx-tech-detect", "evidence": None, "program_id": pid}]
+        Unique: (service_url, tech)
+        """
+        now = utcnow()
+        new_count = 0
+
+        for it in items or []:
+            service_url = (it.get("service_url") or "").strip()
+            tech = (it.get("tech") or "").strip().lower()
+            if not service_url or not tech:
+                continue
+
+            pid = it.get("program_id")
+            pid = int(pid) if isinstance(pid, int) or (isinstance(pid, str) and str(pid).isdigit()) else None
+
+            try:
+                self.session.add(
+                    Fingerprint(
+                        program_id=pid,
+                        service_url=service_url,
+                        tech=tech,
+                        source=it.get("source"),
+                        evidence=it.get("evidence"),
+                        first_seen=now,
+                        last_seen=now,
+                    )
+                )
+                self.session.flush()
+                new_count += 1
+
+            except IntegrityError:
+                self.session.rollback()
+
+                row = self.session.execute(
+                    select(Fingerprint).where(
+                        Fingerprint.service_url == service_url,
+                        Fingerprint.tech == tech,
+                    )
+                ).scalar_one()
+
+                row.last_seen = now
+                if it.get("source") and not row.source:
+                    row.source = it["source"]
+                if it.get("evidence") and not row.evidence:
+                    row.evidence = it["evidence"]
+                if pid is not None and row.program_id is None:
+                    row.program_id = pid
+
+                self.session.add(row)
+                self.session.flush()
+
+        return new_count
 
     # ----------------------
     # Discovered Urls
     # ----------------------
-
     def upsert_discovered_urls(self, items: list[dict]) -> int:
         now = utcnow()
 
@@ -364,7 +413,11 @@ class ReconRepo:
                 continue
             seen.add(u)
             normalized_items.append(
-                {"url": u, "source": it.get("source"), "service_url": it.get("service_url")}
+                {
+                    "url": u,
+                    "source": it.get("source"),
+                    "service_url": it.get("service_url"),
+                }
             )
 
         if not normalized_items:
@@ -405,11 +458,12 @@ class ReconRepo:
         self.session.flush()
 
         return new_count
-    
+
     def list_new_discovered_urls_since(self, dt: datetime) -> list[tuple[str, str | None]]:
         q = select(DiscoveredURL.url, DiscoveredURL.source).where(DiscoveredURL.first_seen > dt)
         rows = self.session.execute(q).all()
         return sorted(set(rows))
+
 
     
    
