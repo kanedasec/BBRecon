@@ -67,6 +67,8 @@ class Subdomain(Base):
     __tablename__ = "subdomains"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
+
     fqdn: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     root_domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
@@ -80,6 +82,8 @@ class Service(Base):
     __tablename__ = "services"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
+    
     url: Mapped[str] = mapped_column(String(2048), unique=True, index=True)
     fqdn: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     scheme: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
@@ -103,6 +107,8 @@ class DiscoveredURL(Base):
     __tablename__ = "discovered_urls"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
+    
     url: Mapped[str] = mapped_column(String(2048), unique=True, index=True)
     source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     service_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True, index=True)

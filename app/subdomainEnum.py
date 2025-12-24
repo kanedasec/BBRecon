@@ -130,6 +130,9 @@ def check_dns_with_massdns(subdomains: Set[str]) -> Set[str]:
                 if dns:
                     resolved.add(dns)
 
+    print("[+] Cleaning temporary files: ")
+    os.remove(out_json_path)
+
     return resolved
 
 
