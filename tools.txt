@@ -1,0 +1,25 @@
+# Database
+sudo apt install sqlite3
+
+# Subdomain Discovery 
+#---Subfinder
+go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+#---Amass
+CGO_ENABLED=0 go install -v github.com/owasp-amass/amass/v5/cmd/amass@main#---Assetfinder
+go install github.com/tomnomnom/assetfinder@latest
+#---Chaos
+go install -v github.com/projectdiscovery/chaos-client/cmd/chaos@latest
+
+# Asset Probing & Discovery
+#---httpx
+go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+
+# Content Discovery & Crawling
+#---Katana
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+#---waybackurls
+go install github.com/tomnomnom/waybackurls@latest
+#---hakrawler
+go install github.com/hakluke/hakrawler@latest
+#---gau (as i use zsh i needed to change binary name in ~/go/bin to gaux)
+go install github.com/lc/gau/v2/cmd/gau@latest
