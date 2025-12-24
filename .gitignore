@@ -1,0 +1,38 @@
+# --- Python cache / bytecode ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtualenvs ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Environment variables / secrets ---
+.env
+.env.*
+
+# --- Local IDE/editor settings ---
+.vscode/
+.idea/
+
+# --- Local database ---
+recon.db
+*.db
+*.sqlite
+*.sqlite3
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Logs / temp ---
+*.log
+*.tmp
+tmp/
+
+# --- Artifacts ---
+artifacts/mass_scope.txt
+artifacts/massdns_out.json
