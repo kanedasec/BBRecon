@@ -77,7 +77,6 @@ Example:
 ```
 DATABASE_URL=sqlite:///recon.db
 PROGRAMS_FILE=programs_list.txt
-DOMAINS_LIST=artifacts/domains.txt
 RESOLVERS_LIST=artifacts/resolvers.txt
 ARTIFACTS_DIR=artifacts
 CHAOS_API=YOUR_CHAOS_API_KEY
