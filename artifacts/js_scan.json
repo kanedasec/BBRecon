@@ -1,0 +1,122 @@
+[
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1765875834",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/dd8a9177ed8af220-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1764926759",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/d8833361a0ac6e3e-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1761210280",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/f40b0f6b050b03e7-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1760617819",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/6a19cbf5fdbf37f4-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1758269156",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/2ee7a07c59a5c204-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1752223553",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/9db3265c2ae18385-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1750083481",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/ba6a5f3b70c41f63-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://www.roke.co.uk/wp-content/themes/assemble/dist/js/main.js?ver=1747811842",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/8c023b3704739969-main.js",
+    "hits": [
+      {
+        "name": "google_api_key",
+        "preview": "AIzaSyBA6js8swqhwMcMsYDYbgSkS7vA54pl3HU",
+        "line": 888,
+        "col": 14526
+      }
+    ]
+  },
+  {
+    "js_url": "https://recruitment.roke.co.uk/assets/scripts/CookieConsent/cookieconsent.min.js?v=V5ypd1JbnRx8ZZvwjzBLXNCiuvrW0dsZGTz1eHZ_WfA",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/1c01f40280de2e7c-cookieconsent.min.js",
+    "hits": [
+      {
+        "name": "generic_key_assign",
+        "preview": "api_key: 'vOgI3748dnIytIrsJcxS7qsDf6kbJkE9lN4yEDrXAqXcKUNvjjZPox3ekXqmMMld'",
+        "line": 1185,
+        "col": 15
+      }
+    ]
+  },
+  {
+    "js_url": "https://recruitment.roke.co.uk/assets/scripts/CookieConsent/cookieconsent.min.js",
+    "path": "/home/kanedasec/Tools/Bounty/Recon/artifacts/js/roke_vdp/0e4cc4519591d15e-cookieconsent.min.js",
+    "hits": [
+      {
+        "name": "generic_key_assign",
+        "preview": "api_key: 'vOgI3748dnIytIrsJcxS7qsDf6kbJkE9lN4yEDrXAqXcKUNvjjZPox3ekXqmMMld'",
+        "line": 1185,
+        "col": 15
+      }
+    ]
+  }
+]

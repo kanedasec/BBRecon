@@ -1,6 +1,6 @@
-# Recon
+# BBRecon
 
-**Recon** is a modular, database‑driven reconnaissance pipeline designed for **bug bounty hunters and AppSec engineers** who want *signal over noise*.
+**BBRecon** is a modular, database‑driven reconnaissance pipeline designed for **bug bounty hunters and AppSec engineers** who want *signal over noise*.
 
 Recon focuses on **change detection, asset intelligence, and manual‑testing enablement**, not blind scanning.
 
@@ -82,24 +82,23 @@ python -m recon.cli --help
 Runs one or more pipeline steps for a program.
 
 ```bash
-recon run --program <program_name>
+python -m recon.cli run --program <program_name>
 ```
 
 Run a specific step only:
 
 ```bash
-recon run --program <program_name> --step js_analysis
+python -m recon.cli run --program <program_name> --step js_analysis
 ```
 
 Supported steps:
 
 1. `scope` – Download HackerOne / VDP scope
-2. `subdomains` – Enumerate subdomains
-3. `dns` – Resolve and normalize DNS
-4. `http` – Probe services with httpx
-5. `fingerprint` – Technology detection
-6. `content` – URL & asset discovery
-7. `js_analysis` – JavaScript discovery & inspection
+2. `subdomains` – Enumerate subdomains and normalize DNS
+3. `http` – Probe services with httpx
+4. `fingerprint` – Technology detection
+5. `content` – URL & asset discovery
+6. `js_analysis` – JavaScript discovery & inspection
 
 ---
 
@@ -108,7 +107,7 @@ Supported steps:
 Shows what changed since the last run.
 
 ```bash
-recon report --program <program_name>
+python -m recon.cli report --program <program_name>
 ```
 
 Examples of reported diffs:
@@ -123,8 +122,8 @@ Examples of reported diffs:
 Export formats:
 
 ```bash
-recon report --program foo --out-json report.json
-recon report --program foo --out-md report.md
+python -m recon.cli report --program foo --out-json report.json
+python -m recon.cli report --program foo --out-md report.md
 ```
 
 ---
@@ -134,7 +133,7 @@ recon report --program foo --out-md report.md
 Generates Burp scope configuration and URL lists.
 
 ```bash
-recon burp --program <program_name>
+python -m recon.cli burp --program <program_name>
 ```
 
 Options:
@@ -167,12 +166,12 @@ No raw secrets are stored.
 
 ---
 
-### `js-scan` — Offline JavaScript Secret Scan
+### `secret-scan` — Offline JavaScript Secret Scan
 
 Scans **downloaded JS artifacts on disk** using DB paths.
 
 ```bash
-recon js-scan --program <program_name>
+python -m recon.cli secret-scan --program <program_name>
 ```
 
 Features:
@@ -185,8 +184,8 @@ Features:
 Optional outputs:
 
 ```bash
-recon js-scan --program foo --out-json artifacts/js_scan.json
-recon js-scan --program foo --out-html artifacts/js_scan.html
+python -m recon.cli secret-scan --program foo --out-json artifacts/js_scan.json
+python -m recon.cli secret-scan --program foo --out-html artifacts/js_scan.html
 ```
 
 Filtering:
@@ -208,6 +207,8 @@ Downloads program scope and stores root domains.
 Uses tools like:
 - `subfinder`
 - `assetfinder`
+- `chaos`
+- `massdns`
 
 Deduplicates and links subdomains to programs.
 
@@ -215,12 +216,7 @@ Deduplicates and links subdomains to programs.
 
 ---
 
-### 3. DNS Resolution
-Resolves discovered subdomains and normalizes results.
-
----
-
-### 4. HTTP Probing
+### 3. HTTP Probing
 Uses `httpx` to detect:
 - Alive services
 - Status codes
@@ -232,7 +228,7 @@ Uses `httpx` to detect:
 
 ---
 
-### 5. Technology Fingerprinting
+### 4. Technology Fingerprinting
 Detects:
 - Frameworks
 - WAFs
@@ -244,10 +240,12 @@ Diff‑aware across runs.
 
 ---
 
-### 6. Content Discovery
+### 5. Content Discovery
 Uses:
 - `katana`
 - `hakrawler`
+- `gau` (renamed binary as gaux)
+
 
 Finds:
 - URLs
@@ -258,7 +256,7 @@ Finds:
 
 ---
 
-### 7. JavaScript Analysis
+### 6. JavaScript Analysis
 Two‑layer approach:
 
 #### Layer 1 — JS Discovery
@@ -298,20 +296,20 @@ Recon is designed to be **legally and operationally safe**.
 
 ```bash
 # Initial recon
-recon run --program example
+python -m recon.cli run --program example
 
 # Incremental updates
-recon run --program example --step content
-recon run --program example --step js_analysis
+python -m recon.cli run --program example --step content
+python -m recon.cli run --program example --step js_analysis
 
 # Review changes
-recon report --program example
+python -m recon.cli report --program example
 
-# Offline JS review
-recon js-scan --program example
+# Offline Secrets scan
+python -m recon.cli secret-scan --program example
 
-# Burp setup
-recon burp --program example
+# Burp configuration file
+python -m recon.cli burp --program example
 ```
 
 ---
