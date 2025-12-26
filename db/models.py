@@ -10,6 +10,7 @@ from sqlalchemy import (
     Text,
     ForeignKey,
     UniqueConstraint,
+    Boolean,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -137,3 +138,26 @@ class Fingerprint(Base):
 
     def __repr__(self) -> str:
         return f"<Fingerprint tech={self.tech} service_url={self.service_url}>"
+
+class JSArtifact(Base):
+    __tablename__ = "js_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
+
+    url: Mapped[str] = mapped_column(String(2048), unique=True, index=True)
+    sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    content_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+
+    has_secrets: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    secret_types: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)  # "jwt,aws_key,..."
+    secret_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    last_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+    def __repr__(self) -> str:
+        return f"<JSArtifact url={self.url} sha256={self.sha256}>"

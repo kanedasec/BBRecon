@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Optional, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from .models import (
@@ -15,6 +15,7 @@ from .models import (
     Service,
     DiscoveredURL,
     Fingerprint,
+    JSArtifact,
 )
 
 
@@ -216,7 +217,7 @@ class ReconRepo:
     def list_subdomains(self, root_domain=None, only_recent_days=None):
         q = select(Subdomain.fqdn, Subdomain.last_seen)
         if root_domain:
-            q = q.where(Subdomain.root_domain == root_domain)
+            q = q.where(Subdomain.root_domain == normalize_domain(root_domain))
 
         rows = self.session.execute(q).all()
 
@@ -274,64 +275,59 @@ class ReconRepo:
 
         pid: int | None = None
         if program:
-            p = self.get_or_create_program(program)
-            pid = p.id
+            pid = self.get_or_create_program(program).id
 
-        normalized: list[dict] = []
+        # 1) normalize + dedupe by url (last one wins)
+        by_url: dict[str, dict] = {}
         for r in httpx_results or []:
             url = str(r.get("url", "")).strip()
             if not url:
                 continue
-            normalized.append(r)
+            by_url[url] = r
 
-        if not normalized:
+        if not by_url:
             return 0
 
-        urls = sorted({str(r.get("url", "")).strip() for r in normalized if r.get("url")})
-        existing_rows = self.session.execute(
-            select(Service.url).where(Service.url.in_(urls))
+        urls = list(by_url.keys())
+
+        # 2) fetch all existing services in one query
+        existing = self.session.execute(
+            select(Service).where(Service.url.in_(urls))
         ).scalars().all()
-        existing_set = set(existing_rows)
+        existing_map = {s.url: s for s in existing}
 
         new_count = 0
 
-        for r in normalized:
-            url = str(r.get("url", "")).strip()
-            if not url:
-                continue
+        for url, r in by_url.items():
+            svc = existing_map.get(url)
 
-            if url not in existing_set:
+            if svc is None:
                 svc = Service(
                     program_id=pid,
                     url=url,
                     fqdn=normalize_domain(str(r.get("input") or r.get("host") or "")) or None,
-                    scheme=r.get("scheme"),
-                    host=r.get("host"),
+                    scheme=(r.get("scheme") or None),
+                    host=(r.get("host") or None),
                     port=str(r.get("port")) if r.get("port") is not None else None,
                     title=r.get("title"),
                     webserver=r.get("webserver"),
                     content_type=r.get("content_type"),
-                    status_code=int(r["status_code"])
-                    if "status_code" in r and str(r["status_code"]).isdigit()
-                    else None,
+                    status_code=int(r["status_code"]) if str(r.get("status_code", "")).isdigit() else None,
                     ip=r.get("host_ip"),
                     first_seen=now,
                     last_seen=now,
                 )
                 self.session.add(svc)
                 new_count += 1
+                existing_map[url] = svc
             else:
-                svc = self.session.execute(select(Service).where(Service.url == url)).scalar_one()
                 svc.last_seen = now
                 svc.title = r.get("title") or svc.title
                 svc.webserver = r.get("webserver") or svc.webserver
                 svc.content_type = r.get("content_type") or svc.content_type
                 svc.ip = r.get("host_ip") or svc.ip
-
-                # backfill program_id if missing
                 if pid is not None and svc.program_id is None:
                     svc.program_id = pid
-
                 self.session.add(svc)
 
         return new_count
@@ -645,3 +641,227 @@ class ReconRepo:
 
         rows = self.session.execute(q).all()
         return sorted(set(rows))
+
+    # ----------------------
+    # JS Analyzers
+    # ----------------------
+
+    def list_js_candidate_urls(
+            self,
+            program: str | None = None,
+    ) -> list[str]:
+        """
+        JS candidates from discovered_urls + services (scoped by program if provided).
+        Includes .js .mjs .js.map and query variants.
+        """
+        pid = self._program_id(program) if program is not None else None
+        if program is not None and pid is None:
+            return []
+
+        def _is_js(u: str) -> bool:
+            u = (u or "").lower()
+            return (
+                    u.endswith(".js")
+                    or u.endswith(".mjs")
+                    or u.endswith(".js.map")
+                    or ".js?" in u
+                    or ".mjs?" in u
+                    or ".js.map?" in u
+            )
+
+        q1 = select(DiscoveredURL.url)
+        q2 = select(Service.url)
+
+        if pid is not None:
+            q1 = q1.where(DiscoveredURL.program_id == pid)
+            q2 = q2.where(Service.program_id == pid)
+
+        urls: list[str] = []
+        urls += self.session.execute(q1).scalars().all()
+        urls += self.session.execute(q2).scalars().all()
+
+        return sorted({u for u in urls if u and _is_js(u)})
+
+    def list_missing_js_artifacts(
+            self,
+            urls: list[str],
+    ) -> list[str]:
+        """
+        Given candidate urls, return only those not yet stored in js_artifacts.
+        """
+        if not urls:
+            return []
+
+        existing = self.session.execute(
+            select(JSArtifact.url).where(JSArtifact.url.in_(urls))
+        ).scalars().all()
+        exist_set = set(existing)
+        return [u for u in urls if u not in exist_set]
+
+    def upsert_js_artifact(
+            self,
+            url: str,
+            sha256: str | None,
+            size_bytes: int | None,
+            content_type: str | None,
+            path: str | None,
+            program: str | None = None,
+            changed: bool = False,
+    ) -> None:
+        """
+        Upsert a JSArtifact. If sha changes, updates last_changed_at.
+        Also backfills program_id if missing.
+        """
+        now = utcnow()
+
+        pid: int | None = None
+        if program:
+            pid = self.get_or_create_program(program).id
+
+        url = (url or "").strip()
+        if not url:
+            return
+
+        try:
+            self.session.add(
+                JSArtifact(
+                    program_id=pid,
+                    url=url,
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                    content_type=content_type,
+                    path=path,
+                    first_seen=now,
+                    last_seen=now,
+                    last_changed_at=now if changed else None,
+                )
+            )
+            self.session.flush()
+            return
+        except IntegrityError:
+            self.session.rollback()
+
+        row = self.session.execute(
+            select(JSArtifact).where(JSArtifact.url == url)
+        ).scalar_one()
+
+        row.last_seen = now
+
+        # backfill program_id
+        if pid is not None and row.program_id is None:
+            row.program_id = pid
+
+        # backfill metadata
+        if content_type and not row.content_type:
+            row.content_type = content_type
+        if path and not row.path:
+            row.path = path
+        if size_bytes is not None:
+            row.size_bytes = size_bytes
+
+        # detect change by sha
+        if sha256 and sha256 != row.sha256:
+            row.sha256 = sha256
+            row.last_changed_at = now
+
+        self.session.add(row)
+        self.session.flush()
+
+    def mark_js_secrets(
+            self,
+            js_url: str,
+            has_secrets: bool,
+            secret_types: list[str] | None = None,
+            secret_count: int = 0,
+            program: str | None = None,
+    ) -> None:
+        """
+        Stores only the SUMMARY on JSArtifact:
+          - has_secrets (bool)
+          - secret_types (comma-separated string)
+          - secret_count (int)
+
+        This avoids storing raw secrets.
+        """
+        js_url = (js_url or "").strip()
+        if not js_url:
+            return
+
+        pid = self._program_id(program) if program else None
+
+        types_str: str | None = None
+        if secret_types:
+            types_str = ",".join(sorted({t.strip().lower() for t in secret_types if t.strip()})) or None
+
+        row = self.session.execute(
+            select(JSArtifact).where(JSArtifact.url == js_url)
+        ).scalar_one_or_none()
+
+        if row is None:
+            # Create stub so we don’t lose the signal
+            self.upsert_js_artifact(
+                url=js_url,
+                sha256=None,
+                size_bytes=None,
+                content_type=None,
+                path=None,
+                program=program,
+                changed=False,
+            )
+            row = self.session.execute(
+                select(JSArtifact).where(JSArtifact.url == js_url)
+            ).scalar_one()
+
+        row.has_secrets = bool(has_secrets)
+        row.secret_types = types_str
+        row.secret_count = int(secret_count or 0)
+        row.last_seen = utcnow()
+
+        # optional: backfill program_id
+        if pid is not None and row.program_id is None:
+            row.program_id = pid
+
+        self.session.add(row)
+        self.session.flush()
+
+    def list_js_artifact_paths(
+            self,
+            program: str | None = None,
+            only_with_secrets: bool | None = None,
+            only_changed_after: datetime | None = None,
+            limit: int | None = None,
+    ) -> list[tuple[str, str]]:
+        """
+        Returns list of (js_url, local_path) for downloaded JS artifacts.
+
+        - only_with_secrets: if True, only JSArtifact.has_secrets == True
+        - only_changed_after: if set, only artifacts with last_changed_at > dt
+        """
+        q = select(JSArtifact.url, JSArtifact.path).where(JSArtifact.path.is_not(None))
+
+        if program is not None:
+            pid = self._program_id(program)
+            if pid is None:
+                return []
+            q = q.where(JSArtifact.program_id == pid)
+
+        if only_with_secrets is True:
+            q = q.where(JSArtifact.has_secrets.is_(True))
+        elif only_with_secrets is False:
+            q = q.where(JSArtifact.has_secrets.is_(False))
+
+        if only_changed_after is not None:
+            q = q.where(JSArtifact.last_changed_at.is_not(None))
+            q = q.where(JSArtifact.last_changed_at > only_changed_after)
+
+        q = q.order_by(JSArtifact.last_seen.desc())
+
+        if limit is not None:
+            q = q.limit(int(limit))
+
+        rows = self.session.execute(q).all()
+        out: list[tuple[str, str]] = []
+        for js_url, path in rows:
+            if path:
+                out.append((js_url, path))
+        return out
