@@ -127,7 +127,7 @@ def run_asset_probing(
                 continue
 
             total_results += len(batch_results)
-            total_new_services += repo.upsert_services(batch_results)
+            total_new_services += repo.upsert_services(batch_results, program=program)
 
         repo.finish_run(run_id)
 

@@ -115,11 +115,12 @@ def normalize_urls(lines: Iterable[str]) -> list[str]:
     return out
 
 
-def store(repo: ReconRepo, urls: list[str], source: str) -> int:
+def store(repo: ReconRepo, urls: list[str], source: str, program: str | None = None) -> int:
     items = [{"url": u, "source": source} for u in urls]
     if not items:
         return 0
-    return repo.upsert_discovered_urls(items)
+    return repo.upsert_discovered_urls(items, program=program)
+
 
 
 def run_content_discovery(
@@ -134,7 +135,6 @@ def run_content_discovery(
     with get_session() as session:
         repo = ReconRepo(session)
 
-        # If you want program scoping later, switch to repo.list_service_urls_scoped(...)
         service_urls = repo.list_service_urls(status_code=200)
 
     if not service_urls:
@@ -177,8 +177,8 @@ def run_content_discovery(
 
             print(f"[NORM] katana={len(k)} | hakrawler={len(h)}")
 
-            added_k = store(repo, k, "katana")
-            added_h = store(repo, h, "hakrawler")
+            added_k = store(repo, k, "katana", program=program)
+            added_h = store(repo, h, "hakrawler", program=program)
 
             total_new += (added_k + added_h)
             print(f"[DB] added katana={added_k} | added hakrawler={added_h} | total_new={total_new}")
@@ -194,8 +194,8 @@ def run_content_discovery(
 
             print(f"[NORM] wayback={len(w)} | gau={len(g)}")
 
-            added_w = store(repo, w, "waybackurls")
-            added_g = store(repo, g, "gau")
+            added_w = store(repo, w, "waybackurls", program=program)
+            added_g = store(repo, g, "gau", program=program)
 
             total_new += (added_w + added_g)
             print(f"[DB] added wayback={added_w} | added gau={added_g} | total_new={total_new}")

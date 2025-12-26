@@ -18,6 +18,29 @@ INTERESTING_PATTERNS = [
     r"/.git\b", r"/.env\b",
 ]
 
+HIGH_VALUE_TECH = {
+    "grafana",
+    "kibana",
+    "jenkins",
+    "gitlab",
+    "gitlab ci",
+    "sonarqube",
+    "nexus",
+    "harbor",
+    "vault",
+    "keycloak",
+    "kong",
+    "istio",
+    "argo",
+    "argocd",
+    "airflow",
+    "splunk",
+}
+
+
+def norm_tech(s: str) -> str:
+    return (s or "").strip().lower()
+
 
 def find_interesting(urls: list[str]) -> list[str]:
     out = []
@@ -83,10 +106,14 @@ def md_report(
     step_ref: str,
     new_subdomains: list[str],
     new_services: list[tuple[str, Optional[int]]],
-    new_urls: list[tuple[str, Optional[str]]],
+    new_urls_rows: list[tuple[str, Optional[str]]],
     interesting_urls: list[str],
+    new_tech: list[tuple[str, str]],
+    high_value_tech_hits: list[tuple[str, str]],
+    tech_supported: bool,
 ) -> str:
     sc_counts = summarize_statuses(new_services)
+
     lines: list[str] = []
     lines.append("# Recon Diff Report")
     lines.append("")
@@ -94,11 +121,17 @@ def md_report(
     lines.append(f"- **Program:** `{program or 'ALL'}`")
     lines.append(f"- **Step reference (for since=last):** `{step_ref}`")
     lines.append("")
+
     lines.append("## Summary")
     lines.append(f"- New subdomains: **{len(new_subdomains)}**")
     lines.append(f"- New services: **{len(new_services)}**")
-    lines.append(f"- New URLs: **{len(new_urls)}** (interesting: **{len(interesting_urls)}**)")
+    lines.append(f"- New URLs: **{len(new_urls_rows)}** (interesting: **{len(interesting_urls)}**)")
+    if tech_supported:
+        lines.append(f"- New technologies: **{len(new_tech)}** (high-value hits: **{len(high_value_tech_hits)}**)")
+    else:
+        lines.append("- New technologies: **N/A** (repo/db does not support fingerprints yet)")
     lines.append("")
+
     if sc_counts:
         lines.append("### Service Status Codes")
         for k, v in sc_counts.items():
@@ -112,6 +145,34 @@ def md_report(
         if len(interesting_urls) > 50:
             lines.append(f"- ... (+{len(interesting_urls) - 50} more)")
         lines.append("")
+
+    if tech_supported:
+        lines.append("## 🧪 Technology Changes")
+        lines.append("")
+        lines.append(f"Total new technology observations: **{len(new_tech)}**")
+        lines.append("")
+
+        if high_value_tech_hits:
+            lines.append("### 🚨 High-value technology hits")
+            lines.append("")
+            lines.append("| Technology | Service |")
+            lines.append("|---|---|")
+            for service_url, tech in high_value_tech_hits[:200]:
+                lines.append(f"| `{tech}` | {service_url} |")
+            if len(high_value_tech_hits) > 200:
+                lines.append(f"\n- ... (+{len(high_value_tech_hits) - 200} more)")
+            lines.append("")
+
+        if new_tech:
+            lines.append("### New technologies detected")
+            lines.append("")
+            lines.append("| Service | Technology |")
+            lines.append("|---|---|")
+            for service_url, tech in new_tech[:500]:
+                lines.append(f"| {service_url} | `{tech}` |")
+            if len(new_tech) > 500:
+                lines.append(f"\n- ... (+{len(new_tech) - 500} more)")
+            lines.append("")
 
     lines.append("## New Subdomains")
     for s in new_subdomains[:100]:
@@ -128,13 +189,13 @@ def md_report(
     lines.append("")
 
     lines.append("## New Discovered URLs")
-    for url, src in new_urls[:200]:
+    for url, src in new_urls_rows[:200]:
         if src:
             lines.append(f"- [{src}] {url}")
         else:
             lines.append(f"- {url}")
-    if len(new_urls) > 200:
-        lines.append(f"- ... (+{len(new_urls) - 200} more)")
+    if len(new_urls_rows) > 200:
+        lines.append(f"- ... (+{len(new_urls_rows) - 200} more)")
     lines.append("")
 
     return "\n".join(lines)
@@ -153,8 +214,13 @@ class DiffReport:
     interesting_urls: list[str]
     status_breakdown: dict
 
+    # NEW
+    tech_supported: bool
+    new_tech: list[tuple[str, str]]              # (service_url, tech)
+    high_value_tech_hits: list[tuple[str, str]]  # (service_url, tech)
+
     def to_payload(self) -> dict:
-        return {
+        payload = {
             "since": self.since_dt.isoformat(),
             "program": self.program,
             "step_ref": self.step_ref,
@@ -171,10 +237,20 @@ class DiffReport:
             "interesting_urls": self.interesting_urls,
         }
 
+        payload["tech_supported"] = self.tech_supported
+        if self.tech_supported:
+            payload["counts"]["new_tech"] = len(self.new_tech)
+            payload["counts"]["high_value_tech_hits"] = len(self.high_value_tech_hits)
+            payload["new_tech"] = [{"service_url": u, "tech": t} for u, t in self.new_tech]
+            payload["high_value_tech_hits"] = [{"service_url": u, "tech": t} for u, t in self.high_value_tech_hits]
+
+        return payload
+
 
 def build_report(program: Optional[str], since: str, step_ref: str = "content_discovery") -> DiffReport:
     """
     Build a diff report using DB state.
+
     Requires repo methods:
       - list_new_subdomains_since(dt, root_domains=None)
       - list_new_services_since(dt, fqdn_list=None)
@@ -182,6 +258,10 @@ def build_report(program: Optional[str], since: str, step_ref: str = "content_di
       - list_subdomains_for_root_domains(root_domains)
       - list_scope_domains(program=...)
       - get_last_finished_run_time(step)
+
+    For Tech Diff:
+      - list_new_fingerprints_since(dt, service_urls=None) -> list[(service_url, tech)]
+        (If not present, report still works; tech_supported=False)
     """
     with get_session() as session:
         repo = ReconRepo(session)
@@ -202,9 +282,30 @@ def build_report(program: Optional[str], since: str, step_ref: str = "content_di
 
             scoped_subdomains = repo.list_subdomains_for_root_domains(root_domains) or []
 
+        # core diffs
         new_subdomains = repo.list_new_subdomains_since(since_dt, root_domains=root_domains)
         new_services = repo.list_new_services_since(since_dt, fqdn_list=scoped_subdomains)
         new_urls_rows = repo.list_new_discovered_urls_since(since_dt)
+
+        # tech diff (optional, depends on repo/db support)
+        tech_supported = hasattr(repo, "list_new_fingerprints_since")
+        new_tech_rows: list[tuple[str, str]] = []
+        high_value_hits: list[tuple[str, str]] = []
+
+        if tech_supported:
+            # Scope tech diff to "new services since dt" when available
+            service_urls = [u for (u, _sc) in new_services] if new_services else None
+            try:
+                new_tech_rows = repo.list_new_fingerprints_since(since_dt, service_urls=service_urls) or []
+            except TypeError:
+                # In case your repo signature is list_new_fingerprints_since(dt) only
+                new_tech_rows = repo.list_new_fingerprints_since(since_dt) or []
+
+            # Normalize + dedupe
+            dedup = sorted({(svc, norm_tech(tech)) for svc, tech in new_tech_rows if svc and tech})
+            new_tech_rows = dedup
+
+            high_value_hits = [(svc, tech) for svc, tech in new_tech_rows if tech in HIGH_VALUE_TECH]
 
     new_urls = [u for u, _src in new_urls_rows]
     interesting = find_interesting(new_urls)
@@ -219,6 +320,9 @@ def build_report(program: Optional[str], since: str, step_ref: str = "content_di
         new_urls=new_urls_rows,
         interesting_urls=interesting,
         status_breakdown=status_breakdown,
+        tech_supported=tech_supported,
+        new_tech=new_tech_rows,
+        high_value_tech_hits=high_value_hits,
     )
 
 
@@ -236,8 +340,11 @@ def write_md(report: DiffReport, out_path: str) -> None:
         step_ref=report.step_ref,
         new_subdomains=report.new_subdomains,
         new_services=report.new_services,
-        new_urls=report.new_urls,
+        new_urls_rows=report.new_urls,
         interesting_urls=report.interesting_urls,
+        new_tech=report.new_tech,
+        high_value_tech_hits=report.high_value_tech_hits,
+        tech_supported=report.tech_supported,
     )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(md)

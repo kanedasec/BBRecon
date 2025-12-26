@@ -1,43 +1,31 @@
-# Recon – Bug Bounty Recon Automation
+# BBRecon
 
-Recon is a **stateful bug bounty reconnaissance automation framework** designed for long‑running, repeatable, and auditable recon workflows.
+BBRecon is a **stateful reconnaissance pipeline** designed for bug bounty, VDP, and AppSec workflows.
+Instead of ad‑hoc scripts, Recon treats reconnaissance as a **repeatable data pipeline** with history, diffs, and reporting.
 
-This project is **not** a collection of one‑off scripts. It is a recon *system* built around:
+The goal is not just to find assets once, but to:
 
-* Database‑backed state (no blind re‑scans)
-* Incremental pipelines (only process what’s new)
-* Clear execution tracking (runs, timestamps, metadata)
-* CLI‑driven orchestration
-* Tool‑agnostic design
+* Continuously discover **new attack surface**
+* Track **what changed** since the last run
+* Prioritize **high‑value findings** (new hosts, services, technologies, URLs)
 
 ---
 
-## High‑Level Pipeline
+## High‑level Architecture
+
+Recon follows a **pipeline architecture**, where each step:
+
+* Reads input from the database
+* Executes external tools
+* Writes normalized results back to the database
+* Records execution metadata (`runs` table)
 
 ```
-HackerOne Scope
-     ↓
-Scope Domains (DB)
-     ↓
-Subdomain Enumeration
-     ↓
-Resolved Subdomains (DB)
-     ↓
-Service Probing (HTTPX)
-     ↓
-Live Services (DB)
-     ↓
-Content Discovery
-     ↓
-Discovered URLs (DB)
+scope → subdomains → probe → fingerprint → content → report
 ```
 
-Each step:
-
-* Is safe to re‑run
-* Tracks `first_seen` / `last_seen`
-* Writes results incrementally
-* Records execution metadata in the `runs` table
+All orchestration lives in `recon/pipeline/`.
+The CLI (`recon/cli.py`) is intentionally thin and only wires commands to pipeline steps.
 
 ---
 
@@ -46,312 +34,252 @@ Each step:
 ```
 Recon/
 ├── recon/
-│   ├── cli.py                # CLI entrypoint (Typer)
-│   └── pipeline/
-│       ├── scope.py          # Scope orchestration
-│       ├── subdomains.py     # Subdomain enumeration orchestration
-│       ├── probe.py          # Asset / service probing orchestration
-│       └── content.py        # Content discovery orchestration
-│
-├── app/
-│   ├── scopeDownload.py      # HackerOne scope ingestion
-│   ├── subdomainEnum.py      # Subdomain enumeration logic
-│   ├── assetProbing.py       # HTTP probing (httpx)
-│   └── contentDiscovery.py   # Crawling + archive discovery
+│   ├── cli.py                # Typer CLI (run, report)
+│   ├── pipeline/             # Pipeline steps (orchestration)
+│   │   ├── scope.py
+│   │   ├── subdomains.py
+│   │   ├── probe.py
+│   │   ├── fingerprint.py
+│   │   └── content.py
+│   ├── reporting.py          # Diff & alerting logic
+│   └── __init__.py
 │
 ├── db/
 │   ├── base.py
-│   ├── session.py
-│   ├── models.py
-│   └── repo.py
+│   ├── models.py             # SQLAlchemy models
+│   ├── repo.py               # DB access layer
+│   └── session.py
 │
-├── artifacts/                # Local tool outputs (ignored by git)
+├── artifacts/                # Generated outputs (ignored by git)
 ├── requirements.txt
-├── .env
-└── recon.db                  # SQLite DB (local default)
+└── README.md
 ```
 
 ---
 
-## Environment Configuration
+## Database‑Driven by Design
 
-Example `.env`:
+Recon stores **everything** in a database:
 
+* Scope domains
+* Subdomains
+* HTTP services
+* Technology fingerprints
+* Discovered URLs
+* Pipeline runs
+
+This enables:
+
+* Incremental runs ("only new since last time")
+* Accurate diffing
+* Alerting and reporting
+* Future integrations (dashboards, notifications)
+
+---
+
+## Pipeline Steps
+
+### 1️⃣ Scope Discovery (`scope`)
+
+Downloads in‑scope assets from HackerOne programs and normalizes them.
+
+* Source: HackerOne CSV
+* Output table: `scopes`
+* Deduplicated per program
+
+```bash
+python -m recon.cli run --step scope --program example_vdp
 ```
-DATABASE_URL=sqlite:///recon.db
-PROGRAMS_FILE=programs_list.txt
-RESOLVERS_LIST=artifacts/resolvers.txt
-ARTIFACTS_DIR=artifacts
-CHAOS_API=YOUR_CHAOS_API_KEY
+
+---
+
+### 2️⃣ Subdomain Enumeration (`subdomains`)
+
+Enumerates subdomains for scoped root domains.
+
+Tools used:
+
+* `subfinder`
+
+* `assetfinder`
+
+* `chaos`
+
+* `massdns` (validation)
+
+* Output table: `subdomains`
+
+* Tracks `first_seen` / `last_seen`
+
+```bash
+python -m recon.cli run --step subdomains
 ```
+
+---
+
+### 3️⃣ Asset Probing (`probe`)
+
+Probes discovered subdomains using **httpx**.
+
+* Determines live services
+
+* Collects metadata (status, title, server, IP, etc.)
+
+* Only probes **new subdomains** since last run
+
+* Output table: `services`
+
+```bash
+python -m recon.cli run --step probe
+```
+
+---
+
+### 4️⃣ Technology Fingerprinting (`fingerprint`)
+
+Enriches live services with detected technologies.
+
+* Tool: `httpx -tech-detect`
+* Runs only on **new services** since last fingerprint run
+
+Examples of detected tech:
+
+* nginx, apache
+
+* react, vue
+
+* grafana, kibana
+
+* wordpress
+
+* Output table: `fingerprints`
+
+```bash
+python -m recon.cli run --step fingerprint
+```
+
+---
+
+### 5️⃣ Content Discovery (`content`)
+
+Discovers endpoints and URLs using active and passive techniques.
+
+Active crawling:
+
+* `katana`
+* `hakrawler`
+
+Passive discovery:
+
+* `waybackurls`
+
+* `gau`
+
+* Input: `services(status_code=200)`
+
+* Output table: `discovered_urls`
+
+Highly verbose by design to support long‑running scans.
+
+```bash
+python -m recon.cli run --step content
+```
+
+---
+
+### 6️⃣ Diff & Reporting (`report`)
+
+Generates a **diff report** showing what’s new since a given time reference.
+
+Supports:
+
+* `last` run
+* Relative times (`24h`, `7d`, `30m`)
+* Program‑scoped or global reports
+
+Outputs:
+
+* New subdomains
+* New services (with status breakdown)
+* New discovered URLs
+* Highlighted **interesting URLs** (admin, login, graphql, etc.)
+
+```bash
+python -m recon.cli report --since last
+python -m recon.cli report --since 24h --program example_vdp
+```
+
+Optional exports:
+
+```bash
+python -m recon.cli report --since last \
+  --out-json artifacts/diff.json \
+  --out-md artifacts/diff.md
+```
+
+---
+
+## Interesting URL Detection
+
+Recon automatically highlights URLs matching high‑value patterns:
+
+* `/admin`, `/login`, `/auth`
+* `/swagger`, `/openapi`, `/api-docs`
+* `/graphql`
+* `/.git`, `/.env`
+
+This helps prioritize manual testing quickly.
 
 ---
 
 ## CLI Usage
 
-Recon is driven via a single CLI entrypoint:
+### Run full pipeline
 
+```bash
+python -m recon.cli run --program example_vdp
 ```
-python -m recon.cli run [OPTIONS]
+
+### Run a single step
+
+```bash
+python -m recon.cli run --step probe
 ```
 
-### Common Commands
+### Global (no program scoping)
 
-Run full pipeline for all programs listed in `PROGRAMS_FILE`:
-
-```
+```bash
 python -m recon.cli run --all
 ```
-
-Run full pipeline for a single program:
-
-```
-python -m recon.cli run --program fanduel-vdp
-```
-
-Run individual steps:
-
-```
-python -m recon.cli run --step scope --program fanduel-vdp
-python -m recon.cli run --step subdomains --program fanduel-vdp
-python -m recon.cli run --step probe --program fanduel-vdp
-python -m recon.cli run --step content --program fanduel-vdp
-```
-
-Allow interactive fallback (explicit opt‑in):
-
-```
-python -m recon.cli run --all --interactive
-```
-
-> By default, the CLI is **non‑interactive** and safe for automation.
-
----
-
-## Pipeline Details
-
-### 1. Scope Download
-
-* Pulls scope directly from HackerOne CSV
-* Expands wildcard identifiers (e.g. `*.example.*`)
-* Uses only Python stdlib (no pandas)
-* Stores scope domains per program
-
-Tracked in DB:
-
-* program
-* domain
-* first_seen / last_seen
-
----
-
-### 2. Subdomain Enumeration
-
-Tools:
-
-* subfinder
-* assetfinder
-* chaos
-* massdns (validation)
-
-Features:
-
-* Parallel execution
-* DNS validation before persistence
-* Root‑domain association
-
----
-
-### 3. Asset / Service Probing
-
-Tool:
-
-* httpx
-
-Features:
-
-* Probes **only new subdomains** since last run
-* Batch‑based execution
-* Stores full HTTP metadata (status, title, server, IP)
-
----
-
-### 4. Content Discovery (Verbose)
-
-Tools:
-
-* katana (active crawling)
-* hakrawler (active crawling)
-* waybackurls (passive)
-* gau (passive)
-
-Behavior:
-
-* Runs only on services with `status_code = 200`
-* Two explicit phases:
-
-  * **Active crawling** (service URLs)
-  * **Passive discovery** (domains)
-
-Verbose output includes:
-
-* Phase start banners
-* Batch progress (X/Y)
-* Per‑tool execution time
-* URLs collected per tool
-* URLs inserted into DB per batch
-
-This makes long‑running discovery **observable and debuggable**.
-
----
-
-## Database Model Overview
-
-Core entities:
-
-* **Program** – Bug bounty program (e.g. HackerOne team)
-* **ScopeDomain** – Root domains in scope
-* **Subdomain** – Enumerated and resolved subdomains
-* **Service** – Live HTTP services
-* **DiscoveredURL** – URLs found via crawling / archives
-* **Run** – Execution metadata
-
-All entities track:
-
-* `first_seen`
-* `last_seen`
-
-This enables:
-
-* Recon diffs
-* Drift detection
-* Historical analysis
 
 ---
 
 ## Design Principles
 
-* Database as source of truth
-* Incremental recon (no wasted scans)
-* Deterministic pipelines
-* Explicit CLI intent
-* Minimal external dependencies
+* **Stateful**: every result has history
+* **Incremental**: new‑only by default
+* **Tool‑agnostic**: easy to swap tools
+* **CLI‑first**: but scheduler‑ready
+* **No monolithic scripts**
 
-This design scales naturally from:
-
-* Single‑program recon
-* To multi‑program continuous recon
-
----
-
-## Diff & Alerting (Implemented)
-
-Recon now includes **native diff & reporting capabilities**, turning the pipeline into a **continuous recon system** instead of a one‑shot scanner.
-
-### What “Diff” Means in Recon
-
-Recon uses **database timestamps (`first_seen`)** as the source of truth.
-
-A diff answers:
-
-> *What is new since a given point in time?*
-
-This works reliably even across crashes, partial runs, or re‑execution of steps.
-
-### Diff Sources
-
-Diffs are calculated for:
-
-* **Subdomains** – new `Subdomain.first_seen`
-* **Services** – new HTTP services discovered by httpx
-* **Discovered URLs** – new URLs from crawling and archives
-
-### CLI Reporting Command
-
-Generate a diff report directly from the CLI:
-
-```bash
-python -m recon.cli report
-```
-
-Default behavior:
-
-* Uses the **last finished `content_discovery` run** as reference
-* Reports **global changes** across all programs
-
-### Common Examples
-
-Diff since last content discovery run:
-
-```bash
-python -m recon.cli report
-```
-
-Diff for a specific program:
-
-```bash
-python -m recon.cli report --program fanduel-vdp
-```
-
-Diff since last 24 hours:
-
-```bash
-python -m recon.cli report --since 24h
-```
-
-Export results:
-
-```bash
-python -m recon.cli report \
-  --since 24h \
-  --out-json artifacts/diff.json \
-  --out-md artifacts/diff.md
-```
-
-### Output
-
-Terminal summary:
-
-```
-[DIFF] since=2025-12-24T14:48:46Z program=ALL
-New subdomains: 12
-New services:   7
-  status breakdown: {"200": 4, "302": 2, "403": 1}
-New URLs:       183 (interesting: 9)
-```
-
-### Interesting URL Detection
-
-Recon highlights **high‑signal URLs** automatically, including:
-
-* `/admin`, `/login`, `/auth`
-* `/swagger`, `/openapi`, `/graphql`
-* exposed `.git` or `.env` paths
-
-This logic lives in:
-
-```
-recon/reporting.py
-```
-
-and is reused by the CLI and future alerting backends.
-
-### Architecture Notes
-
-* `cli.py` is intentionally **thin** (only Typer commands)
-* All reporting logic lives in `recon/reporting.py`
-* Reporting uses **lazy imports** to keep CLI startup fast
-* Reporting gracefully degrades if optional repo methods are missing
-
-This design allows future integrations (Slack, Telegram, Webhooks)
-without changing the CLI interface.
+Recon is built to scale from personal bug bounty usage to team‑level AppSec monitoring.
 
 ---
 
 ## Roadmap
 
-* Alerting backends (Telegram / Slack)
-* Scheduled diff execution
-* Program‑level foreign keys for precise scoping
-* Severity heuristics for discovered URLs
-* Automatic ticket / note generation
+* [x] Stateful pipeline
+* [x] Diff & reporting
+* [x] Tech fingerprinting
+* [ ] JS files scan
+* [ ] Vulnerabilities scan
+* [ ] Alerting (Telegram / Slack)
+* [ ] Scheduler / cron wrapper
+* [ ] Dashboard export
+
+---
+
+## Disclaimer
+
+This project is intended for **authorized security testing only**.
+Always respect program rules and legal boundaries.
