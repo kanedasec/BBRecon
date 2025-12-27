@@ -3,9 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -14,24 +12,29 @@ from db.session import get_session
 from db.repo import ReconRepo
 
 
+# ----------------------------
+# Regexes
+# ----------------------------
+
 JS_EXT_RE = re.compile(r"(?i)\.(mjs|js)(?:$|\?)")
 JS_MAP_RE = re.compile(r"(?i)\.js\.map(?:$|\?)")
 JS_CANDIDATE_RE = re.compile(r"(?i)\.(?:mjs|js)(?:$|[?#])|\.js\.map(?:$|[?#])")
 
-# very pragmatic endpoint regexes
-ABS_URL_RE = re.compile(r"https?://[a-z0-9\.\-_:]+(?:/[^\s\"\'\)<>\]]*)?", re.IGNORECASE)
+ABS_URL_RE = re.compile(
+    r"https?://[a-z0-9\.\-_:]+(?:/[^\s\"\'\)<>\]]*)?",
+    re.IGNORECASE,
+)
+
 REL_PATH_RE = re.compile(
     r"(?:(?:\"|')(/(?:api|graphql|swagger|openapi|api-docs|v1|v2|v3|rest)[^\"']+)(?:\"|'))",
     re.IGNORECASE,
 )
 
-# secrets-ish (pragmatic; tune later)
 JWT_RE = re.compile(r"eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}")
 GENERIC_KEY_RE = re.compile(
     r"(?i)\b(api[_-]?key|secret|token|bearer|authorization)\b\s*[:=]\s*['\"][^'\"]{8,}['\"]"
 )
 
-# optional: add some common patterns
 AWS_ACCESS_KEY_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 SLACK_TOKEN_RE = re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,48}\b")
 GITHUB_TOKEN_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,120}\b")
@@ -39,8 +42,13 @@ GITHUB_TOKEN_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,120}\b")
 DOMAIN_RE = re.compile(r"(?i)\b([a-z0-9][a-z0-9\-]{0,62}\.)+[a-z]{2,}\b")
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
+
 def is_js_url(u: str) -> bool:
     return bool(JS_CANDIDATE_RE.search((u or "").strip()))
+
 
 def safe_filename_from_url(u: str) -> str:
     h = hashlib.sha1(u.encode("utf-8")).hexdigest()[:16]
@@ -50,57 +58,49 @@ def safe_filename_from_url(u: str) -> str:
     return f"{h}-{base}"
 
 
-@dataclass
-class JSAnalysisResult:
-    js_url: str
-    sha256: str
-    size_bytes: int
-    content_type: Optional[str]
-    endpoints: list[str]
-    domains: list[str]
-    secret_types: list[str]
-    secret_hits: list[str]
-
-
 def download_js(url: str, timeout: int = 25) -> tuple[bytes, str | None]:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "ReconJS/1.0"})
+    r = requests.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": "ReconJS/1.0"},
+    )
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}")
-    ctype = r.headers.get("content-type")
-    return r.content, ctype
+    return r.content, r.headers.get("content-type")
 
 
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+# ----------------------------
+# Extraction
+# ----------------------------
+
 def extract_from_js(js_text: str, base_url: str) -> tuple[list[str], list[str], list[str], list[str]]:
     """
-    Returns: endpoints, domains, secret_types, secret_hits
-    NOTE: secret_hits are SHORT SNIPPETS (no full dump). Types are what you store in DB.
+    Returns:
+      endpoints, domains, secret_types, secret_hits
+
+    secret_hits are SHORT masked snippets (never raw secrets).
     """
     endpoints: set[str] = set()
     domains: set[str] = set()
-
     secret_types: set[str] = set()
     secret_hits: set[str] = set()
 
-    # absolute urls
     for m in ABS_URL_RE.findall(js_text):
         endpoints.add(m)
 
-    # relative paths -> normalize to full URL
     for m in REL_PATH_RE.findall(js_text):
         try:
             endpoints.add(urljoin(base_url, m))
         except Exception:
-            continue
+            pass
 
-    # domains
     for d in DOMAIN_RE.findall(js_text):
         domains.add(d.lower())
 
-    # --- secrets-ish ---
     for s in JWT_RE.findall(js_text):
         secret_types.add("jwt")
         secret_hits.add(f"jwt:{s[:30]}...")
@@ -129,13 +129,17 @@ def extract_from_js(js_text: str, base_url: str) -> tuple[list[str], list[str], 
     )
 
 
+# ----------------------------
+# Main pipeline step
+# ----------------------------
+
 def run_js_analysis(
     program: str | None = None,
     artifacts_dir: str = "artifacts/js",
     only_new: bool = True,
     max_files: int | None = None,
 ) -> None:
-    # 1) candidates
+    # 1) get candidates
     with get_session() as session:
         repo = ReconRepo(session)
         candidates = repo.list_js_candidate_urls(program=program)
@@ -145,7 +149,7 @@ def run_js_analysis(
         print("[OK] No JS candidates found.")
         return
 
-    # 2) run + process
+    # 2) process
     with get_session() as session:
         repo = ReconRepo(session)
         run_id = repo.start_run(
@@ -175,8 +179,8 @@ def run_js_analysis(
 
         total_downloaded = 0
         total_endpoints = 0
-        total_secrets = 0
         total_domains = 0
+        total_secrets = 0
 
         discovered_to_insert: list[dict] = []
 
@@ -191,9 +195,11 @@ def run_js_analysis(
             size = len(body)
 
             fname = safe_filename_from_url(u)
-            fpath = str((base_dir / fname).resolve())
-            with open(fpath, "wb") as f:
-                f.write(body)
+            file_path = (base_dir / fname).resolve()
+            fpath = str(file_path)
+
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(body)
 
             try:
                 text = body.decode("utf-8", errors="ignore")
@@ -202,7 +208,7 @@ def run_js_analysis(
 
             endpoints, domains, secret_types, secret_hits = extract_from_js(text, base_url=u)
 
-            # store artifact row (upsert)
+            # upsert artifact (ALWAYS store path)
             repo.upsert_js_artifact(
                 url=u,
                 sha256=digest,
@@ -213,7 +219,7 @@ def run_js_analysis(
                 changed=False,
             )
 
-            # mark secrets summary (no raw secrets stored)
+            # secret summary only
             repo.mark_js_secrets(
                 js_url=u,
                 has_secrets=bool(secret_types),
@@ -222,9 +228,25 @@ def run_js_analysis(
                 program=program,
             )
 
-            # feed endpoints back into discovered_urls
+            # semantic snapshot (for diffing)
+            repo.record_js_artifact_version(
+                js_url=u,
+                sha256=digest,
+                extracted={
+                    "endpoints": endpoints,
+                    "domains": domains,
+                    "secret_types": secret_types,
+                    "content_type": ctype,
+                    "size_bytes": size,
+                    "path": fpath,
+                },
+                program=program,
+            )
+
             for ep in endpoints:
-                discovered_to_insert.append({"url": ep, "source": "js-analysis", "service_url": u})
+                discovered_to_insert.append(
+                    {"url": ep, "source": "js-analysis", "service_url": u}
+                )
 
             total_downloaded += 1
             total_endpoints += len(endpoints)
@@ -232,12 +254,12 @@ def run_js_analysis(
             total_secrets += len(secret_hits)
 
             print(
-                f"[OK] {u} size={size} endpoints={len(endpoints)} domains={len(domains)} "
-                f"secrets={len(secret_hits)} types={secret_types}"
+                f"[OK] {u} size={size} endpoints={len(endpoints)} "
+                f"domains={len(domains)} secrets={len(secret_hits)} types={secret_types}"
             )
 
         if discovered_to_insert:
-            uniq = {}
+            uniq: dict[str, dict] = {}
             for it in discovered_to_insert:
                 url = (it.get("url") or "").strip()
                 if url:

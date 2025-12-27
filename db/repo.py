@@ -4,8 +4,10 @@ import json
 from datetime import datetime, timezone, timedelta
 from typing import Iterable, Optional, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+
+from pathlib import Path
 
 from .models import (
     Run,
@@ -16,6 +18,7 @@ from .models import (
     DiscoveredURL,
     Fingerprint,
     JSArtifact,
+    JSArtifactVersion,
 )
 
 
@@ -682,21 +685,35 @@ class ReconRepo:
 
         return sorted({u for u in urls if u and _is_js(u)})
 
-    def list_missing_js_artifacts(
-            self,
-            urls: list[str],
-    ) -> list[str]:
+    def list_missing_js_artifacts(self, urls: list[str]) -> list[str]:
         """
-        Given candidate urls, return only those not yet stored in js_artifacts.
+        Given candidate urls, return those that are missing in js_artifacts
+        OR exist but have no cached local path.
         """
         if not urls:
             return []
 
-        existing = self.session.execute(
-            select(JSArtifact.url).where(JSArtifact.url.in_(urls))
-        ).scalars().all()
-        exist_set = set(existing)
-        return [u for u in urls if u not in exist_set]
+        rows = self.session.execute(
+            select(JSArtifact.url, JSArtifact.path).where(JSArtifact.url.in_(urls))
+        ).all()
+
+        have_path: set[str] = set()
+        seen: set[str] = set()
+        for u, p in rows:
+            if u:
+                seen.add(u)
+                if p:
+                    have_path.add(u)
+
+        # Missing if:
+        # - not in table at all, OR
+        # - in table but path is null/empty
+        missing = []
+        for u in urls:
+            if u not in seen or u not in have_path:
+                missing.append(u)
+
+        return missing
 
     def upsert_js_artifact(
             self,
@@ -743,29 +760,50 @@ class ReconRepo:
 
         row = self.session.execute(
             select(JSArtifact).where(JSArtifact.url == url)
-        ).scalar_one()
+        ).scalar_one_or_none()
 
+        if row is None:
+            # Create a new artifact row (true upsert)
+            row = JSArtifact(
+                program_id=pid,
+                url=url,
+                sha256=sha256,
+                size_bytes=size_bytes,
+                content_type=content_type,
+                path=path,
+                first_seen=now,
+                last_seen=now,
+                last_changed_at=now if changed else None,
+                has_secrets=False,
+                secret_count=0,
+                secret_types="",
+            )
+            self.session.add(row)
+            self.session.flush()
+            return row
+
+        # Existing row: update
         row.last_seen = now
 
-        # backfill program_id
-        if pid is not None and row.program_id is None:
-            row.program_id = pid
-
-        # backfill metadata
-        if content_type and not row.content_type:
-            row.content_type = content_type
-        if path and not row.path:
-            row.path = path
+        # Update metadata if present
         if size_bytes is not None:
             row.size_bytes = size_bytes
+        if content_type:
+            row.content_type = content_type
+        if path:
+            row.path = path
 
-        # detect change by sha
-        if sha256 and sha256 != row.sha256:
+        # Detect change by sha difference (or explicit changed=True)
+        if sha256 and row.sha256 != sha256:
             row.sha256 = sha256
             row.last_changed_at = now
+        elif changed:
+            # if caller says "changed" but sha didn't differ, still mark change
+            row.last_changed_at = now
 
-        self.session.add(row)
         self.session.flush()
+        return row
+
 
     def mark_js_secrets(
             self,
@@ -834,16 +872,15 @@ class ReconRepo:
         """
         Returns list of (js_url, local_path) for downloaded JS artifacts.
 
-        - only_with_secrets: if True, only JSArtifact.has_secrets == True
-        - only_changed_after: if set, only artifacts with last_changed_at > dt
+        Program-scoped:
+          - include any artifact whose path is under artifacts/js/<program>/
+          - OR whose URL is in the program's JS candidate set
+        Uses real Path prefix checks (no fragile LIKE substring assumptions).
         """
-        q = select(JSArtifact.url, JSArtifact.path).where(JSArtifact.path.is_not(None))
-
-        if program is not None:
-            pid = self._program_id(program)
-            if pid is None:
-                return []
-            q = q.where(JSArtifact.program_id == pid)
+        q = select(JSArtifact.url, JSArtifact.path).where(
+            JSArtifact.path.is_not(None),
+            JSArtifact.path != "",
+        )
 
         if only_with_secrets is True:
             q = q.where(JSArtifact.has_secrets.is_(True))
@@ -856,12 +893,221 @@ class ReconRepo:
 
         q = q.order_by(JSArtifact.last_seen.desc())
 
+        rows = self.session.execute(q).all()
+        out: list[tuple[str, str]] = [(u, p) for (u, p) in rows if u and p]
+
+        if program is not None:
+            prog = normalize_domain(program)
+            base = Path("artifacts/js") / prog
+            base_abs = base.resolve()
+
+            # candidate URL set (may be small but cheap to include)
+            cand = set(self.list_js_candidate_urls(program=program))
+
+            filtered: list[tuple[str, str]] = []
+            for js_url, path in out:
+                try:
+                    p = Path(path).expanduser().resolve()
+                except Exception:
+                    p = None
+
+                in_prog_dir = False
+                if p is not None:
+                    try:
+                        # True if p is within base_abs
+                        p.relative_to(base_abs)
+                        in_prog_dir = True
+                    except Exception:
+                        in_prog_dir = False
+
+                if in_prog_dir or js_url in cand:
+                    filtered.append((js_url, path))
+
+            out = filtered
+
         if limit is not None:
-            q = q.limit(int(limit))
+            out = out[: int(limit)]
+
+        return out
+
+    def list_js_signals_since(
+            self,
+            since_dt: datetime,
+            program: str | None = None,
+    ) -> list[tuple[str, bool, bool, int, str | None]]:
+        """
+        Returns JS scoring signals since `since_dt`.
+
+        Output tuples:
+          (js_url, changed, has_secrets, secret_count, secret_types)
+
+        'changed' means last_changed_at > since_dt.
+        Also includes newly first_seen > since_dt (even if last_changed_at is null).
+        """
+        pid = self._program_id(program) if program is not None else None
+        if program is not None and pid is None:
+            return []
+
+        q = select(
+            JSArtifact.url,
+            JSArtifact.last_changed_at,
+            JSArtifact.first_seen,
+            JSArtifact.has_secrets,
+            JSArtifact.secret_count,
+            JSArtifact.secret_types,
+        )
+
+        if pid is not None:
+            q = q.where(JSArtifact.program_id == pid)
+
+        # include either new artifacts or changed ones
+        q = q.where(
+            (JSArtifact.first_seen > since_dt)
+            | ((JSArtifact.last_changed_at.is_not(None)) & (JSArtifact.last_changed_at > since_dt))
+        )
+
+        q = q.order_by(JSArtifact.last_seen.desc())
 
         rows = self.session.execute(q).all()
-        out: list[tuple[str, str]] = []
-        for js_url, path in rows:
-            if path:
-                out.append((js_url, path))
+        out: list[tuple[str, bool, bool, int, str | None]] = []
+        for url, last_changed_at, first_seen, has_secrets, secret_count, secret_types in rows:
+            changed = bool(last_changed_at and last_changed_at > since_dt)
+            out.append((url, changed, bool(has_secrets), int(secret_count or 0), secret_types))
+        return out
+
+    def record_js_artifact_version(
+            self,
+            js_url: str,
+            sha256: str,
+            extracted: dict,
+            program: str | None = None,
+    ) -> None:
+        """
+        Persist a JS semantic snapshot keyed by sha256.
+
+        - Ensures a JSArtifact exists (upserts)
+        - Inserts a JSArtifactVersion (unique on artifact_id+sha)
+        """
+        # Ensure artifact exists with correct sha
+        self.upsert_js_artifact(
+            url=js_url,
+            sha256=sha256,
+            size_bytes=extracted.get("size_bytes"),
+            content_type=extracted.get("content_type"),
+            path=extracted.get("path"),
+            program=program,
+            changed=False,
+        )
+
+        artifact = self.session.execute(
+            select(JSArtifact).where(JSArtifact.url == js_url)
+        ).scalar_one()
+
+        payload = json.dumps(extracted, ensure_ascii=False, sort_keys=True)
+
+        # Use a savepoint: avoid rolling back the whole JS run if this version already exists
+        with self.session.begin_nested():
+            try:
+                self.session.add(
+                    JSArtifactVersion(
+                        js_artifact_id=artifact.id,
+                        sha256=sha256,
+                        extracted_json=payload,
+                    )
+                )
+                self.session.flush()
+            except IntegrityError:
+                # Version already recorded; ignore safely
+                pass
+
+    def list_js_semantic_changes_since(
+            self,
+            since_dt: datetime,
+            program: str | None = None,
+    ) -> list[dict]:
+        """
+        For JS artifacts changed since `since_dt`, returns semantic diffs based on the
+        latest two stored JSArtifactVersion snapshots.
+
+        Output item:
+          {
+            "url": str,
+            "new_sha256": str,
+            "old_sha256": str,
+            "changed_at": iso str | None,
+            "endpoints_added": [...],
+            "endpoints_removed": [...],
+            "domains_added": [...],
+            "domains_removed": [...],
+            "secret_types_added": [...],
+            "secret_types_removed": [...],
+          }
+        """
+        pid = self._program_id(program) if program is not None else None
+        if program is not None and pid is None:
+            return []
+
+        q = select(JSArtifact).where(
+            (JSArtifact.last_changed_at.is_not(None)) & (JSArtifact.last_changed_at > since_dt)
+        )
+        if pid is not None:
+            q = q.where(JSArtifact.program_id == pid)
+
+        artifacts = self.session.execute(q).scalars().all()
+        out: list[dict] = []
+
+        for a in artifacts:
+            # Fetch last two versions for this artifact
+            vq = (
+                select(JSArtifactVersion)
+                .where(JSArtifactVersion.js_artifact_id == a.id)
+                .order_by(JSArtifactVersion.created_at.desc())
+                .limit(2)
+            )
+            versions = self.session.execute(vq).scalars().all()
+            if len(versions) < 2:
+                continue
+
+            new_v, old_v = versions[0], versions[1]
+            try:
+                new_j = json.loads(new_v.extracted_json)
+                old_j = json.loads(old_v.extracted_json)
+            except Exception:
+                continue
+
+            def to_set(obj: dict, key: str) -> set[str]:
+                v = obj.get(key) or []
+                if not isinstance(v, list):
+                    return set()
+                return {str(x) for x in v if x}
+
+            new_end = to_set(new_j, "endpoints")
+            old_end = to_set(old_j, "endpoints")
+            new_dom = to_set(new_j, "domains")
+            old_dom = to_set(old_j, "domains")
+            new_sec = to_set(new_j, "secret_types")
+            old_sec = to_set(old_j, "secret_types")
+
+            out.append({
+                "url": a.url,
+                "new_sha256": new_v.sha256,
+                "old_sha256": old_v.sha256,
+                "changed_at": a.last_changed_at.isoformat() if a.last_changed_at else None,
+                "endpoints_added": sorted(new_end - old_end),
+                "endpoints_removed": sorted(old_end - new_end),
+                "domains_added": sorted(new_dom - old_dom),
+                "domains_removed": sorted(old_dom - new_dom),
+                "secret_types_added": sorted(new_sec - old_sec),
+                "secret_types_removed": sorted(old_sec - new_sec),
+            })
+
+        # Sort most “impactful” diffs first
+        out.sort(
+            key=lambda x: (
+                    len(x["endpoints_added"]) + len(x["endpoints_removed"])
+                    + len(x["domains_added"]) + len(x["domains_removed"])
+                    + len(x["secret_types_added"]) + len(x["secret_types_removed"])
+            ),
+            reverse=True,
+        )
         return out

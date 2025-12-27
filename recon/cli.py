@@ -88,6 +88,14 @@ def report(
         for u in rep.interesting_urls[:15]:
             typer.echo(f" - {u}")
 
+    if getattr(rep, "top_interest", None):
+        typer.echo("\nTop interest signals:")
+        for item in rep.top_interest[:15]:
+            typer.echo(f" - [{item['score']:>3}] {item['kind']}: {item['target']}")
+            # one-line reason summary
+            if item.get("reasons"):
+                typer.echo(f"       ↳ {item['reasons'][0]}")
+
     if out_json:
         write_json(rep, out_json)
         typer.echo(f"\n[OK] Wrote JSON report: {out_json}")
@@ -130,27 +138,33 @@ def burp(
 @app.command("secret-scan")
 def secret_scan(
     program: Optional[str] = typer.Option(None, help="Program (HackerOne team). If omitted, scan global."),
-    only_with_secrets_flag: Optional[bool] = typer.Option(None,
-                                                          help="True: scan only artifacts flagged has_secrets; False: only non-flagged; None: all."),
+    only_with_secrets_flag: Optional[bool] = typer.Option(
+        None,
+        help="True: scan only artifacts flagged has_secrets; False: only non-flagged; None: all.",
+    ),
+    scan_mode: str = typer.Option("db", help="db|disk|both (disk scans artifacts folder; db scans JSArtifact.path)"),
     only_changed_since: str = typer.Option("none", help="none|last-js|24h|7d|ISO timestamp"),
     limit: Optional[int] = typer.Option(None, help="Max number of JS files to scan"),
     max_hits_per_file: int = typer.Option(200, help="Max hits per file"),
     out_json: Optional[str] = typer.Option(None, help="Write JSON report path"),
     out_html: Optional[str] = typer.Option(None, help="Write HTML report path"),
-    repair_missing: bool = typer.Option(False, help="Re-download missing JS artifacts before scanning"),
-    artifacts_dir: str = typer.Option("artifacts/js", help="Base folder for JS cache (used for repairs)"),
+    repair_missing: bool = typer.Option(False, help="Re-download missing JS artifacts before scanning (DB mode)"),
+    artifacts_dir: str = typer.Option("artifacts/js", help="Base folder for JS cache (used for disk mode and repairs)"),
 ):
     """
-    Scan DOWNLOADED JS artifacts (local files) using paths stored in DB (JSArtifact.path).
-    Outputs masked previews + line/col to help you locate hits quickly in the saved file.
+    Scan downloaded JS artifacts for secrets.
+    Modes:
+      - db:   scan files referenced by JSArtifact.path in the database
+      - disk: scan files found under artifacts/js/<program>/ (or artifacts/js/ if no program)
+      - both: union of db + disk (de-duped by path)
     """
     from datetime import datetime, timezone, timedelta
+    from pathlib import Path
 
     from db.session import get_session
     from db.repo import ReconRepo
     from recon.js_secrets_finder import scan_files, write_json_report, write_html_report
     from recon.js_cache import ensure_js_cached
-    from pathlib import Path
 
     def parse_since(s: str) -> Optional[datetime]:
         s = (s or "").strip().lower()
@@ -163,72 +177,107 @@ def secret_scan(
         if s == "last-js":
             with get_session() as session:
                 repo = ReconRepo(session)
-                dt = repo.get_last_finished_run_time("js_analysis")
-                return dt
-        # ISO timestamp
+                return repo.get_last_finished_run_time("js_analysis")
         try:
-            # accept "2025-12-26T12:00:00+00:00" etc
             return datetime.fromisoformat(s)
         except Exception:
             raise typer.BadParameter("Invalid only_changed_since. Use none|last-js|24h|7d|ISO timestamp")
 
+    scan_mode = (scan_mode or "db").strip().lower()
+    if scan_mode not in ("db", "disk", "both"):
+        raise typer.BadParameter("Invalid scan_mode. Use db|disk|both")
+
     since_dt = parse_since(only_changed_since)
+
+    def disk_items() -> list[tuple[str, str]]:
+        base = Path(artifacts_dir)
+        if program:
+            base = base / program
+        if not base.exists():
+            return []
+        files: list[tuple[str, str]] = []
+        for p in base.rglob("*"):
+            if not p.is_file():
+                continue
+            suf = p.suffix.lower()
+            if suf not in (".js", ".mjs", ".map"):
+                continue
+            rp = p.resolve()
+            files.append((rp.as_uri(), str(rp)))
+        files.sort(key=lambda x: x[1])
+        if limit is not None:
+            return files[: int(limit)]
+        return files
+
+    items: list[tuple[str, str]] = []
 
     with get_session() as session:
         repo = ReconRepo(session)
-        items = repo.list_js_artifact_paths(
-            program=program,
-            only_with_secrets=only_with_secrets_flag,
-            only_changed_after=since_dt,
-            limit=limit,
-        )
+
+        if scan_mode in ("db", "both"):
+            db_items = repo.list_js_artifact_paths(
+                program=program,
+                only_with_secrets=only_with_secrets_flag,
+                only_changed_after=since_dt,
+                limit=limit,
+            )
+            items.extend(db_items)
+
+        if scan_mode in ("disk", "both"):
+            items.extend(disk_items())
+
+        # de-dupe by path
+        by_path: dict[str, tuple[str, str]] = {}
+        for js_url, path in items:
+            if path:
+                by_path[path] = (js_url, path)
+        items = list(by_path.values())
 
         if not items:
-            typer.echo("[OK] No JS artifacts found to scan (did you run js_analysis?).")
+            typer.echo("[OK] No JS artifacts found to scan.")
             return
 
-        missing = [(u, p) for (u, p) in items if not p or not Path(p).exists()]
-        if missing and not repair_missing:
-            typer.echo(
-                f"[WARN] {len(missing)} JS artifacts are missing on disk. Re-run js_analysis or use --repair-missing.")
-        elif missing and repair_missing:
-            typer.echo(f"[REPAIR] {len(missing)} missing artifacts. Re-downloading into {artifacts_dir}/...")
-            repaired_items: list[tuple[str, str]] = []
-            repaired_ok = 0
-            repaired_fail = 0
+        # Repair missing only makes sense for DB-derived URLs
+        if scan_mode in ("db", "both"):
+            missing = [(u, p) for (u, p) in items if not p or not Path(p).exists()]
+            if missing and not repair_missing:
+                typer.echo(f"[WARN] {len(missing)} JS artifacts missing on disk. Use --repair-missing or re-run js_analysis.")
+            elif missing and repair_missing:
+                typer.echo(f"[REPAIR] {len(missing)} missing artifacts. Re-downloading into {artifacts_dir}/...")
+                repaired_items: list[tuple[str, str]] = []
+                repaired_ok = 0
+                repaired_fail = 0
 
-            for js_url, _old_path in items:
-                # If it exists, keep it; if not, fetch it
-                local_path = _old_path
-                if not local_path or not Path(local_path).exists():
-                    try:
-                        local_path = ensure_js_cached(
-                            repo=repo,
-                            js_url=js_url,
-                            program=program,
-                            artifacts_dir=artifacts_dir,
-                        )
-                        if local_path:
-                            repaired_ok += 1
-                        else:
+                for js_url, old_path in items:
+                    local_path = old_path
+                    if (not local_path) or (not Path(local_path).exists()):
+                        try:
+                            local_path = ensure_js_cached(
+                                repo=repo,
+                                js_url=js_url,
+                                program=program,
+                                artifacts_dir=artifacts_dir,
+                            )
+                            if local_path:
+                                repaired_ok += 1
+                            else:
+                                repaired_fail += 1
+                        except Exception as e:
                             repaired_fail += 1
-                    except Exception as e:
-                        repaired_fail += 1
-                        typer.echo(f"[REPAIR-FAIL] {js_url}: {e}")
-                        local_path = None
+                            typer.echo(f"[REPAIR-FAIL] {js_url}: {e}")
+                            local_path = None
 
-                if local_path and Path(local_path).exists():
-                    repaired_items.append((js_url, local_path))
+                    if local_path and Path(local_path).exists():
+                        repaired_items.append((js_url, local_path))
 
-            session.commit()
-            items = repaired_items
-            typer.echo(f"[REPAIR] ok={repaired_ok} fail={repaired_fail} remaining_to_scan={len(items)}")
+                session.commit()
+                items = repaired_items
+                typer.echo(f"[REPAIR] ok={repaired_ok} fail={repaired_fail} remaining_to_scan={len(items)}")
 
     reports = scan_files(items, max_hits_per_file=max_hits_per_file)
 
     typer.echo(f"[SECRET-SCAN] files_considered={len(items)} files_with_hits={len(reports)} program={program or 'ALL'}")
 
-    # CLI summary (masked previews only)
     for r in reports[:25]:
         typer.echo(f"\nFile: {r.js_url}")
         typer.echo(f"  path: {r.path}")

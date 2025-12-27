@@ -161,3 +161,26 @@ class JSArtifact(Base):
 
     def __repr__(self) -> str:
         return f"<JSArtifact url={self.url} sha256={self.sha256}>"
+
+class JSArtifactVersion(Base):
+    __tablename__ = "js_artifact_versions"
+    __table_args__ = (
+        UniqueConstraint("js_artifact_id", "sha256", name="uq_jsver_artifact_sha"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    js_artifact_id: Mapped[int] = mapped_column(
+        ForeignKey("js_artifacts.id"),
+        index=True,
+    )
+
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    extracted_json: Mapped[str] = mapped_column(Text)  # JSON string (endpoints/domains/secret_types/meta)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    artifact: Mapped["JSArtifact"] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<JSArtifactVersion js_artifact_id={self.js_artifact_id} sha256={self.sha256}>"
+

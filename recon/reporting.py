@@ -9,6 +9,7 @@ from typing import Optional
 
 from db.session import get_session
 from db.repo import ReconRepo
+from recon.interest_scoring import InterestScorer, rank
 
 INTERESTING_PATTERNS = [
     r"/admin\b", r"/administrator\b", r"/manage\b", r"/console\b",
@@ -101,17 +102,19 @@ def summarize_statuses(rows: list[tuple[str, Optional[int]]]) -> dict:
 
 
 def md_report(
-    since_dt: datetime,
-    program: Optional[str],
-    step_ref: str,
-    new_subdomains: list[str],
-    new_services: list[tuple[str, Optional[int]]],
-    new_urls_rows: list[tuple[str, Optional[str]]],
-    interesting_urls: list[str],
-    new_tech: list[tuple[str, str]],
-    high_value_tech_hits: list[tuple[str, str]],
-    tech_supported: bool,
+    since_dt,
+    program,
+    step_ref,
+    new_subdomains,
+    new_services,
+    new_urls_rows,
+    interesting_urls,
+    tech_supported,
+    new_tech,
+    high_value_tech_hits,
+    js_semantic_changes=None,
 ) -> str:
+    js_semantic_changes = js_semantic_changes or []
     sc_counts = summarize_statuses(new_services)
 
     lines: list[str] = []
@@ -131,6 +134,23 @@ def md_report(
     else:
         lines.append("- New technologies: **N/A** (repo/db does not support fingerprints yet)")
     lines.append("")
+
+    if js_semantic_changes:
+        lines.append("## JS semantic changes")
+        lines.append("")
+        for ch in js_semantic_changes[:50]:
+            lines.append(f"### {ch['url']}")
+            lines.append(f"- old: `{ch['old_sha256']}`")
+            lines.append(f"- new: `{ch['new_sha256']}`")
+            if ch["endpoints_added"]:
+                lines.append(f"- endpoints added: {len(ch['endpoints_added'])}")
+            if ch["endpoints_removed"]:
+                lines.append(f"- endpoints removed: {len(ch['endpoints_removed'])}")
+            if ch["domains_added"]:
+                lines.append(f"- domains added: {len(ch['domains_added'])}")
+            if ch["secret_types_added"]:
+                lines.append(f"- secret types added: {', '.join(ch['secret_types_added'])}")
+            lines.append("")
 
     if sc_counts:
         lines.append("### Service Status Codes")
@@ -206,6 +226,7 @@ class DiffReport:
     since_dt: datetime
     program: Optional[str]
     step_ref: str
+    top_interest: list[dict]
 
     new_subdomains: list[str]
     new_services: list[tuple[str, Optional[int]]]
@@ -214,10 +235,11 @@ class DiffReport:
     interesting_urls: list[str]
     status_breakdown: dict
 
-    # NEW
     tech_supported: bool
-    new_tech: list[tuple[str, str]]              # (service_url, tech)
-    high_value_tech_hits: list[tuple[str, str]]  # (service_url, tech)
+    new_tech: list[tuple[str, str]]
+    high_value_tech_hits: list[tuple[str, str]]
+    js_semantic_changes: list[dict]
+
 
     def to_payload(self) -> dict:
         payload = {
@@ -237,7 +259,11 @@ class DiffReport:
             "interesting_urls": self.interesting_urls,
         }
 
+        payload["top_interest"] = self.top_interest
         payload["tech_supported"] = self.tech_supported
+        payload["counts"]["js_semantic_changes"] = len(self.js_semantic_changes)
+        payload["js_semantic_changes"] = self.js_semantic_changes
+
         if self.tech_supported:
             payload["counts"]["new_tech"] = len(self.new_tech)
             payload["counts"]["high_value_tech_hits"] = len(self.high_value_tech_hits)
@@ -286,6 +312,7 @@ def build_report(program: Optional[str], since: str, step_ref: str = "content_di
         new_subdomains = repo.list_new_subdomains_since(since_dt, root_domains=root_domains)
         new_services = repo.list_new_services_since(since_dt, fqdn_list=scoped_subdomains)
         new_urls_rows = repo.list_new_discovered_urls_since(since_dt)
+        js_semantic_changes = repo.list_js_semantic_changes_since(since_dt, program=program)
 
         # tech diff (optional, depends on repo/db support)
         tech_supported = hasattr(repo, "list_new_fingerprints_since")
@@ -311,6 +338,40 @@ def build_report(program: Optional[str], since: str, step_ref: str = "content_di
     interesting = find_interesting(new_urls)
     status_breakdown = summarize_statuses(new_services)
 
+    scorer = InterestScorer()
+    items = []
+
+    # URLs
+    interesting_set = set(interesting)
+    for url, src in new_urls_rows:
+        items.append(scorer.score_url(url=url, is_interesting=(url in interesting_set), source=src))
+
+    # Services
+    for svc_url, sc in new_services:
+        items.append(scorer.score_service(url=svc_url, status_code=sc))
+
+    # High-value tech
+    for svc_url, tech in high_value_hits:
+        items.append(scorer.score_tech(service_url=svc_url, tech=tech))
+
+    # JS signals (new/changed since)
+    js_signals = []
+    if hasattr(repo, "list_js_signals_since"):
+        js_signals = repo.list_js_signals_since(since_dt, program=program)
+
+    for js_url, changed, has_secrets, secret_count, secret_types in (js_signals or []):
+        items.append(
+            scorer.score_js(
+                js_url=js_url,
+                changed=changed,
+                has_secrets=has_secrets,
+                secret_count=secret_count,
+                secret_types=secret_types,
+            )
+        )
+
+    top_interest = [it.to_dict() for it in rank(items, top=20)]
+
     return DiffReport(
         since_dt=since_dt,
         program=program,
@@ -323,6 +384,8 @@ def build_report(program: Optional[str], since: str, step_ref: str = "content_di
         tech_supported=tech_supported,
         new_tech=new_tech_rows,
         high_value_tech_hits=high_value_hits,
+        top_interest=top_interest,
+        js_semantic_changes=js_semantic_changes,
     )
 
 
@@ -345,6 +408,8 @@ def write_md(report: DiffReport, out_path: str) -> None:
         new_tech=report.new_tech,
         high_value_tech_hits=report.high_value_tech_hits,
         tech_supported=report.tech_supported,
+        js_semantic_changes=getattr(report, "js_semantic_changes", []),  # ✅ ADD THIS
     )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(md)
+
