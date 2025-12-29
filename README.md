@@ -1,330 +1,323 @@
 # BBRecon
 
-**BBRecon** is a modular, database‑driven reconnaissance pipeline designed for **bug bounty hunters and AppSec engineers** who want *signal over noise*.
+BBRecon is a **stateful reconnaissance pipeline** designed for bug bounty, VDP, and AppSec workflows.
+Instead of ad‑hoc scripts, Recon treats reconnaissance as a **repeatable data pipeline** with history, diffs, and reporting.
 
-Recon focuses on **change detection, asset intelligence, and manual‑testing enablement**, not blind scanning.
+The goal is not just to find assets once, but to:
 
----
-
-## Philosophy
-
-Recon is built around a few core principles:
-
-- **DB is the source of truth**
-- **Diff > volume**
-- **Recon feeds humans, not scanners**
-- **Everything is program‑scoped**
-- **Tools are replaceable, data is not**
-
-Recon helps you **notice what changed** — new assets, new endpoints, new JavaScript behavior — so vulnerabilities become obvious during manual testing.
+* Continuously discover **new attack surface**
+* Track **what changed** since the last run
+* Prioritize **high‑value findings** (new hosts, services, technologies, URLs)
 
 ---
 
-## High‑Level Architecture
+## High‑level Architecture
+
+Recon follows a **pipeline architecture**, where each step:
+
+* Reads input from the database
+* Executes external tools
+* Writes normalized results back to the database
+* Records execution metadata (`runs` table)
 
 ```
-CLI (Typer)
-  |
-  v
-Pipeline Steps
-  |
-  v
-Database (SQLAlchemy)
-  |
-  v
-Reports / Burp / Artifacts
+scope → subdomains → probe → fingerprint → content → js → nuclei → report
 ```
 
-Core recon loop:
+All orchestration lives in `recon/pipeline/`.
+The CLI (`recon/cli.py`) is intentionally thin and only wires commands to pipeline steps.
+
+---
+
+## Project Structure
 
 ```
-scope → subdomains → http → content → js_analysis
-   ↑                                         ↓
-   └──────── discovered endpoints & assets ──┘
+Recon/
+├── recon/
+│   ├── cli.py                # Typer CLI (run, report, nuclei, secret-scan)
+│   ├── pipeline/             # Pipeline steps (orchestration)
+│   │   ├── scope.py
+│   │   ├── subdomains.py
+│   │   ├── probe.py
+│   │   ├── fingerprint.py
+│   │   └── content.py
+│   │   ├── js_analysis.py
+│   │   └── nuclei_scan.py
+│   ├── reporting.py          # Diff & alerting logic
+│   └── __init__.py
+│
+├── db/
+│   ├── base.py
+│   ├── models.py             # SQLAlchemy models
+│   ├── repo.py               # DB access layer
+│   └── session.py
+│
+├── artifacts/                # Generated outputs (ignored by git)
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
-## Installation
+## Database‑Driven by Design
+
+Recon stores **everything** in a database:
+
+* Scope domains
+* Subdomains
+* HTTP services
+* Technology fingerprints
+* Discovered URLs
+* JS artifacts (cached + summarized)
+* Nuclei findings (summarized)
+* Pipeline runs
+
+This enables:
+
+* Incremental runs ("only new since last time")
+* Accurate diffing
+* Alerting and reporting
+* Future integrations (dashboards, notifications)
+
+---
+
+## Pipeline Steps
+
+### 1️⃣ Scope Discovery (`scope`)
+
+Downloads in‑scope assets from HackerOne programs and normalizes them.
+
+* Source: HackerOne CSV
+* Output table: `scopes`
+* Deduplicated per program
 
 ```bash
-git clone https://github.com/yourname/recon.git
-cd recon
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python -m recon.cli run --step scope --program example_vdp
 ```
+
+---
+
+### 2️⃣ Subdomain Enumeration (`subdomains`)
+
+Enumerates subdomains for scoped root domains.
+
+Tools used:
+
+* `subfinder`
+
+* `assetfinder`
+
+* `chaos`
+
+* `massdns` (validation)
+
+* Output table: `subdomains`
+
+* Tracks `first_seen` / `last_seen`
+
+```bash
+python -m recon.cli run --step subdomains
+```
+
+---
+
+### 3️⃣ Asset Probing (`probe`)
+
+Probes discovered subdomains using **httpx**.
+
+* Determines live services
+
+* Collects metadata (status, title, server, IP, etc.)
+
+* Only probes **new subdomains** since last run
+
+* Output table: `services`
+
+```bash
+python -m recon.cli run --step probe
+```
+
+---
+
+### 4️⃣ Technology Fingerprinting (`fingerprint`)
+
+Enriches live services with detected technologies.
+
+* Tool: `httpx -tech-detect`
+* Runs only on **new services** since last fingerprint run
+
+Examples of detected tech:
+
+* nginx, apache
+
+* react, vue
+
+* grafana, kibana
+
+* wordpress
+
+* Output table: `fingerprints`
+
+```bash
+python -m recon.cli run --step fingerprint
+```
+
+---
+
+### 5️⃣ Content Discovery (`content`)
+
+Discovers endpoints and URLs using active and passive techniques.
+
+Active crawling:
+
+* `katana`
+* `hakrawler`
+
+Passive discovery:
+
+* `waybackurls`
+
+* `gau`
+
+* Input: `services(status_code=200)`
+
+* Output table: `discovered_urls`
+
+Highly verbose by design to support long‑running scans.
+
+```bash
+python -m recon.cli run --step content
+```
+
+---
+
+### 6️⃣ JavaScript Analysis (`js`)
+
+Downloads JavaScript artifacts, extracts endpoints/domains, and stores semantic snapshots.
+
+* Input: `services` + `discovered_urls`
+* Output table: `js_artifacts`
+* Designed to support downstream secret scanning (masked previews only)
+
+```bash
+python -m recon.cli run --step js --program example_vdp
+```
+
+---
+
+### 7️⃣ Nuclei Scan (`nuclei`)
+
+Runs **change-based nuclei** execution against targets that are *new since the last nuclei run*.
+
+Key idea: nuclei is expensive/noisy if you point it at *everything*.
+Recon focuses it on *new services and new URLs*, and stores summarized findings.
+
+* Default: `since=last`, `mode=both`, URL targets filtered to high-signal paths
+* Output table: `nuclei_findings`
+
+```bash
+# via pipeline
+python -m recon.cli run --step nuclei --program example_vdp
+
+# or direct command (more options)
+python -m recon.cli nuclei --program example_vdp --tags exposures,misconfiguration,cves
+```
+
+---
+
+### 6️⃣ Diff & Reporting (`report`)
+
+Generates a **diff report** showing what’s new since a given time reference.
+
+Supports:
+
+* `last` run
+* Relative times (`24h`, `7d`, `30m`)
+* Program‑scoped or global reports
+
+Outputs:
+
+* New subdomains
+* New services (with status breakdown)
+* New discovered URLs
+* Highlighted **interesting URLs** (admin, login, graphql, etc.)
+
+```bash
+python -m recon.cli report --since last
+python -m recon.cli report --since 24h --program example_vdp
+```
+
+Optional exports:
+
+```bash
+python -m recon.cli report --since last \
+  --out-json artifacts/diff.json \
+  --out-md artifacts/diff.md
+```
+
+---
+
+## Interesting URL Detection
+
+Recon automatically highlights URLs matching high‑value patterns:
+
+* `/admin`, `/login`, `/auth`
+* `/swagger`, `/openapi`, `/api-docs`
+* `/graphql`
+* `/.git`, `/.env`
+
+This helps prioritize manual testing quickly.
 
 ---
 
 ## CLI Usage
 
-Main entrypoint:
+### Run full pipeline
 
 ```bash
-python -m recon.cli
+python -m recon.cli run --program example_vdp
 ```
 
-General help:
+### Run a single step
 
 ```bash
-python -m recon.cli --help
+python -m recon.cli run --step probe
 ```
 
----
-
-## Commands (Man Page)
-
----
-
-### `run` — Execute Recon Pipeline
-
-Runs one or more pipeline steps for a program.
+### Global (no program scoping)
 
 ```bash
-python -m recon.cli run --program <program_name>
-```
-
-Run a specific step only:
-
-```bash
-python -m recon.cli run --program <program_name> --step js_analysis
-```
-
-Supported steps:
-
-1. `scope` – Download HackerOne / VDP scope
-2. `subdomains` – Enumerate subdomains and normalize DNS
-3. `http` – Probe services with httpx
-4. `fingerprint` – Technology detection
-5. `content` – URL & asset discovery
-6. `js_analysis` – JavaScript discovery & inspection
-
----
-
-### `report` — Diff & Findings Report
-
-Shows what changed since the last run.
-
-```bash
-python -m recon.cli report --program <program_name>
-```
-
-Examples of reported diffs:
-- New subdomains
-- New services
-- New URLs
-- New JS files
-- Changed JS files
-- New endpoints extracted from JS
-- New secret indicators
-
-Export formats:
-
-```bash
-python -m recon.cli report --program foo --out-json report.json
-python -m recon.cli report --program foo --out-md report.md
+python -m recon.cli run --all
 ```
 
 ---
 
-### `burp` — Generate Burp Suite Scope
+## Design Principles
 
-Generates Burp scope configuration and URL lists.
+* **Stateful**: every result has history
+* **Incremental**: new‑only by default
+* **Tool‑agnostic**: easy to swap tools
+* **CLI‑first**: but scheduler‑ready
+* **No monolithic scripts**
 
-```bash
-python -m recon.cli burp --program <program_name>
-```
-
-Options:
-- Exclude hosts by HTTP status
-- Export alive URLs
-- Generate wildcard scope entries
-
-Outputs:
-- Burp JSON config
-- Plain‑text URL list
+Recon is built to scale from personal bug bounty usage to team‑level AppSec monitoring.
 
 ---
 
-### `js_analysis` — JavaScript Analysis (Pipeline Step)
+## Roadmap
 
-This step is part of `run`, but can be executed independently.
-
-What it does:
-- Identifies JS assets
-- Downloads & caches files
-- Computes SHA‑256 hashes
-- Extracts:
-  - Endpoints
-  - API paths
-  - Domains
-  - Secret indicators (summary only)
-- Feeds endpoints back into content discovery
-
-No raw secrets are stored.
+* [x] Stateful pipeline
+* [x] Diff & reporting
+* [x] Tech fingerprinting
+* [ ] JS files scan
+* [ ] Vulnerabilities scan
+* [ ] Alerting (Telegram / Slack)
+* [ ] Scheduler / cron wrapper
+* [ ] Dashboard export
 
 ---
 
-### `secret-scan` — Offline JavaScript Secret Scan
+## Disclaimer
 
-Scans **downloaded JS artifacts on disk** using DB paths.
-
-```bash
-python -m recon.cli secret-scan --program <program_name>
-```
-
-Features:
-- Offline (no HTTP requests)
-- Program‑scoped
-- Masked output only
-- Line & column context
-- Inspired by SecretFinder
-
-Optional outputs:
-
-```bash
-python -m recon.cli secret-scan --program foo --out-json artifacts/js_scan.json
-python -m recon.cli secret-scan --program foo --out-html artifacts/js_scan.html
-```
-
-Filtering:
-- Scan only changed JS since last run
-- Scan specific programs
-
----
-
-## Pipeline Steps Explained
-
-### 1. Scope Download
-Downloads program scope and stores root domains.
-
-**Table:** `scope_domains`
-
----
-
-### 2. Subdomain Enumeration
-Uses tools like:
-- `subfinder`
-- `assetfinder`
-- `chaos`
-- `massdns`
-
-Deduplicates and links subdomains to programs.
-
-**Table:** `subdomains`
-
----
-
-### 3. HTTP Probing
-Uses `httpx` to detect:
-- Alive services
-- Status codes
-- Titles
-- Headers
-- IPs
-
-**Table:** `services`
-
----
-
-### 4. Technology Fingerprinting
-Detects:
-- Frameworks
-- WAFs
-- Platforms
-
-Diff‑aware across runs.
-
-**Table:** `fingerprints`
-
----
-
-### 5. Content Discovery
-Uses:
-- `katana`
-- `hakrawler`
-- `gau` (renamed binary as gaux)
-
-
-Finds:
-- URLs
-- Endpoints
-- Static assets
-
-**Table:** `discovered_urls`
-
----
-
-### 6. JavaScript Analysis
-Two‑layer approach:
-
-#### Layer 1 — JS Discovery
-- `.js`, `.mjs`, `.js.map`
-- From discovered URLs and services
-
-#### Layer 2 — JS Inspection
-- Download & cache
-- Hash comparison
-- Endpoint extraction
-- Secret pattern detection
-- Feedback loop into content discovery
-
-**Table:** `js_artifacts`
-
----
-
-## Data Safety & OPSEC
-
-### Stored
-- JS metadata
-- Hashes
-- File paths
-- Secret **types & counts**
-
-### Never Stored
-- Raw secrets
-- Tokens
-- Credentials
-- API keys
-
-Recon is designed to be **legally and operationally safe**.
-
----
-
-## Typical Workflow
-
-```bash
-# Initial recon
-python -m recon.cli run --program example
-
-# Incremental updates
-python -m recon.cli run --program example --step content
-python -m recon.cli run --program example --step js_analysis
-
-# Review changes
-python -m recon.cli report --program example
-
-# Offline Secrets scan
-python -m recon.cli secret-scan --program example
-
-# Burp configuration file
-python -m recon.cli burp --program example
-```
-
----
-
-## What Recon Is NOT
-
-- ❌ Not a vulnerability scanner
-- ❌ Not a secret harvester
-- ❌ Not a one‑shot recon script
-
-Recon is a **recon intelligence engine**.
-
----
-
-## Final Mental Model
-
-> Recon helps you **never miss what changed** —  
-> so you can spend your time breaking the right things.
+This project is intended for **authorized security testing only**.
+Always respect program rules and legal boundaries.

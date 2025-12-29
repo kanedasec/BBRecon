@@ -19,6 +19,7 @@ from .models import (
     Fingerprint,
     JSArtifact,
     JSArtifactVersion,
+    NucleiFinding,
 )
 
 
@@ -293,11 +294,17 @@ class ReconRepo:
 
         urls = list(by_url.keys())
 
-        # 2) fetch all existing services in one query
+        # 2) fetch existing services from DB
         existing = self.session.execute(
             select(Service).where(Service.url.in_(urls))
         ).scalars().all()
         existing_map = {s.url: s for s in existing}
+
+        # 3) ALSO consider pending (unflushed) inserts in this session (autoflush=False)
+        #    This prevents duplicates across batches in the same run.
+        for obj in list(self.session.new):
+            if isinstance(obj, Service) and getattr(obj, "url", None):
+                existing_map.setdefault(obj.url, obj)
 
         new_count = 0
 
@@ -321,8 +328,33 @@ class ReconRepo:
                     last_seen=now,
                 )
                 self.session.add(svc)
-                new_count += 1
-                existing_map[url] = svc
+
+                # Flush per insert so we catch UNIQUE conflicts immediately
+                # (instead of failing at commit after multiple batches).
+                try:
+                    self.session.flush()
+                    new_count += 1
+                    existing_map[url] = svc
+                except IntegrityError:
+                    # Another batch/run inserted it (or it already existed but we didn't see it).
+                    self.session.rollback()
+
+                    existing_row = self.session.execute(
+                        select(Service).where(Service.url == url)
+                    ).scalar_one()
+
+                    existing_row.last_seen = now
+                    existing_row.title = r.get("title") or existing_row.title
+                    existing_row.webserver = r.get("webserver") or existing_row.webserver
+                    existing_row.content_type = r.get("content_type") or existing_row.content_type
+                    existing_row.ip = r.get("host_ip") or existing_row.ip
+                    if pid is not None and existing_row.program_id is None:
+                        existing_row.program_id = pid
+
+                    self.session.add(existing_row)
+                    self.session.flush()
+                    existing_map[url] = existing_row
+
             else:
                 svc.last_seen = now
                 svc.title = r.get("title") or svc.title
@@ -1111,3 +1143,196 @@ class ReconRepo:
             reverse=True,
         )
         return out
+
+# ----------------------
+   # Nuclei findings
+   # ----------------------
+    def upsert_nuclei_findings(self, findings: Sequence[dict], program: str | None = None) -> int:
+        """
+        Stores (deduped) nuclei findings.
+
+        Unique: (template_id, matched)
+        """
+        now = utcnow()
+
+        pid: int | None = None
+        if program:
+            pid = self.get_or_create_program(program).id
+
+        # 1) normalize + dedupe input by unique key (template_id, matched)
+        by_key: dict[tuple[str, str], dict] = {}
+        for f in findings or []:
+            if not isinstance(f, dict):
+                continue
+
+            template_id = str(f.get("template-id") or f.get("template_id") or "").strip()
+
+            matched = f.get("matched")
+            if matched is None:
+                matched = f.get("matched-at") or f.get("matched_at")
+            matched = str(matched).strip() if matched is not None else ""
+
+            if not template_id or not matched:
+                continue
+
+            by_key[(template_id, matched)] = f
+
+        if not by_key:
+            return 0
+
+        keys = list(by_key.keys())
+
+        # 2) fetch existing from DB (ORed list for sqlite friendliness)
+        conds = []
+        for (tid, m) in keys:
+            conds.append((NucleiFinding.template_id == tid) & (NucleiFinding.matched == m))
+
+        existing_rows = []
+        if conds:
+            from sqlalchemy import or_
+            existing_rows = self.session.execute(
+                select(NucleiFinding).where(or_(*conds))
+            ).scalars().all()
+
+        existing_map: dict[tuple[str, str], NucleiFinding] = {
+            (r.template_id, r.matched): r for r in existing_rows
+        }
+
+        # 3) ALSO consider pending (unflushed) inserts in this session (autoflush=False)
+        for obj in list(self.session.new):
+            if isinstance(obj, NucleiFinding) and getattr(obj, "template_id", None) and getattr(obj, "matched", None):
+                existing_map.setdefault((obj.template_id, obj.matched), obj)
+
+        new_count = 0
+
+        for (template_id, matched), f in by_key.items():
+            info = f.get("info") or {}
+            if not isinstance(info, dict):
+                info = {}
+
+            template_name = info.get("name") or f.get("template") or f.get("name")
+            severity = info.get("severity")
+            tags = info.get("tags")
+            if isinstance(tags, list):
+                tags = ",".join([str(t) for t in tags if t is not None][:50])
+            elif tags is not None:
+                tags = str(tags)
+
+            description = info.get("description")
+            if isinstance(description, str) and len(description) > 1024:
+                description = description[:1021] + "..."
+
+            reference = info.get("reference")
+            if isinstance(reference, list):
+                reference = "\n".join([str(r) for r in reference][:20])
+            elif reference is not None:
+                reference = str(reference)
+
+            host = f.get("host")
+            if host is not None:
+                host = str(host).strip()
+
+            ftype = f.get("type")
+            if ftype is not None:
+                ftype = str(ftype).strip()
+
+            row = existing_map.get((template_id, matched))
+
+            if row is None:
+                row = NucleiFinding(
+                    program_id=pid,
+                    template_id=template_id,
+                    template_name=template_name,
+                    severity=(str(severity).lower() if severity else None),
+                    host=host or None,
+                    matched=matched,
+                    type=ftype or None,
+                    tags=tags,
+                    description=description,
+                    reference=reference,
+                    matched_at=f.get("matched-at") or f.get("matched_at"),
+                    first_seen=now,
+                    last_seen=now,
+                )
+                self.session.add(row)
+
+                # Flush per insert to avoid blowing up at the end
+                try:
+                    self.session.flush()
+                    existing_map[(template_id, matched)] = row
+                    new_count += 1
+                except IntegrityError:
+                    # If another batch/run inserted it, recover and update last_seen.
+                    self.session.rollback()
+                    existing = self.session.execute(
+                        select(NucleiFinding).where(
+                            NucleiFinding.template_id == template_id,
+                            NucleiFinding.matched == matched,
+                        )
+                    ).scalar_one()
+
+                    existing.last_seen = now
+                    if pid is not None and existing.program_id is None:
+                        existing.program_id = pid
+                    if host and not existing.host:
+                        existing.host = host
+                    if template_name and not existing.template_name:
+                        existing.template_name = template_name
+                    if severity and not existing.severity:
+                        existing.severity = str(severity).lower()
+                    if tags and not existing.tags:
+                        existing.tags = tags
+                    if ftype and not existing.type:
+                        existing.type = ftype
+                    if description and not existing.description:
+                        existing.description = description
+                    if reference and not existing.reference:
+                        existing.reference = reference
+
+                    self.session.add(existing)
+                    self.session.flush()
+                    existing_map[(template_id, matched)] = existing
+
+            else:
+                row.last_seen = now
+                if pid is not None and row.program_id is None:
+                    row.program_id = pid
+
+                # best-effort fill missing fields
+                if host and not row.host:
+                    row.host = host
+                if template_name and not row.template_name:
+                    row.template_name = template_name
+                if severity and not row.severity:
+                    row.severity = str(severity).lower()
+                if tags and not row.tags:
+                    row.tags = tags
+                if ftype and not row.type:
+                    row.type = ftype
+                if description and not row.description:
+                    row.description = description
+                if reference and not row.reference:
+                    row.reference = reference
+
+                self.session.add(row)
+
+        return new_count
+
+    def list_new_nuclei_findings_since(
+       self,
+       dt: datetime,
+       program: str | None = None,
+   ) -> list[tuple[str, str, str | None]]:
+       """Return (matched_url, template_id, severity) for new findings since dt."""
+       q = select(NucleiFinding.matched, NucleiFinding.template_id, NucleiFinding.severity).where(
+           NucleiFinding.first_seen > dt
+       )
+
+       if program is not None:
+           pid = self._program_id(program)
+           if pid is None:
+               return []
+           q = q.where(NucleiFinding.program_id == pid)
+
+       rows = self.session.execute(q).all()
+       return sorted(set(rows))

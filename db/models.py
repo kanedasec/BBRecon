@@ -184,3 +184,34 @@ class JSArtifactVersion(Base):
     def __repr__(self) -> str:
         return f"<JSArtifactVersion js_artifact_id={self.js_artifact_id} sha256={self.sha256}>"
 
+class NucleiFinding(Base):
+    __tablename__ = "nuclei_findings"
+    __table_args__ = (
+        # One finding per (template_id x matched_url). Repeated hits update last_seen.
+        UniqueConstraint("template_id", "matched", name="uq_nuclei_template_matched"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    program_id: Mapped[Optional[int]] = mapped_column(ForeignKey("programs.id"), nullable=True, index=True)
+
+    template_id: Mapped[str] = mapped_column(String(255), index=True)
+    template_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    severity: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    host: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True, index=True)
+    matched: Mapped[str] = mapped_column(String(2048), index=True)
+
+    # Helpful categorization fields
+    type: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, index=True)
+    tags: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
+    # Keep these short: Recon is "summarize, not dump"
+    description: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    reference: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Original match time from nuclei output (string). We also track first/last seen.
+    matched_at: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    def __repr__(self) -> str:
+        return f"<NucleiFinding template_id={self.template_id} matched={self.matched}>"

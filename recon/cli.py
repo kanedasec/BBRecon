@@ -15,6 +15,10 @@ def run(
     max_parallel: int = typer.Option(5, help="Parallelism for subdomain enum"),
     batch_size: int = typer.Option(500, help="Batch size for httpx probing"),
     fp_batch_size: int = typer.Option(300, help="Batch size for httpx -tech-detect"),
+    nuclei_since: str = typer.Option("last", help="Nuclei targets since: last|24h|7d|none|ISO"),
+    nuclei_mode: str = typer.Option("both", help="Nuclei target mode: services|urls|both"),
+    nuclei_tags: Optional[str] = typer.Option(None, help="Nuclei tags filter, e.g. exposures,misconfig,cves"),
+    nuclei_templates: Optional[str] = typer.Option(None, help="Nuclei templates path/dir (optional)"),
 ):
     from recon.pipeline.scope import run_scope_download
     from recon.pipeline.subdomains import run_subdomain_enum
@@ -22,6 +26,7 @@ def run(
     from recon.pipeline.fingerprint import run_fingerprinting
     from recon.pipeline.content import run_content_discovery
     from recon.pipeline.js_analysis import run_js_analysis
+    from recon.pipeline.nuclei_scan import run_nuclei_scan
 
     if step == "all":
         run_scope_download(program=program, run_all=all, interactive=interactive)
@@ -30,6 +35,8 @@ def run(
         run_fingerprinting(program=program, run_all=all, batch_size=fp_batch_size)
         run_content_discovery(program=program, run_all=all)
         run_js_analysis(program=program)
+        run_nuclei_scan(program=program, mode=nuclei_mode, since=nuclei_since, tags=nuclei_tags,
+                        templates=nuclei_templates)
         return
 
     elif step == "scope":
@@ -44,8 +51,11 @@ def run(
         run_content_discovery(program=program, run_all=all)
     elif step == "js":
         run_js_analysis(program=program)
+    elif step == "nuclei":
+        run_nuclei_scan(program=program, mode=nuclei_mode, since=nuclei_since, tags=nuclei_tags,
+                        templates=nuclei_templates)
     else:
-        raise typer.BadParameter("Invalid step. Use scope|subdomains|probe|fingerprint|content|all")
+        raise typer.BadParameter("Invalid step. Use scope|subdomains|probe|fingerprint|content|js|nuclei|all")
 
 
 @app.command()
@@ -127,6 +137,9 @@ def burp(
 
     cfg_path = write_burp_config(program=program, out_path=out_config, exclude_hosts_status=exclude_status)
     typer.echo(f"[OK] Burp config written: {cfg_path}")
+
+    if out_urls and export_urls_status is None:
+        export_urls_status = 200
 
     if export_urls_status is not None:
         if not out_urls:
@@ -293,6 +306,38 @@ def secret_scan(
         p = write_html_report(reports, out_html)
         typer.echo(f"[OK] HTML report: {p}")
 
+@app.command()
+def nuclei(
+    program: Optional[str] = typer.Option(None, help="Program (HackerOne team). If omitted, scan global targets."),
+    mode: str = typer.Option("both", help="Target mode: services|urls|both"),
+    since: str = typer.Option("last", help="Targets since: last|24h|7d|none|ISO timestamp"),
+    tags: Optional[str] = typer.Option(None, help="Nuclei tags filter, e.g. exposures,misconfig,cves"),
+    templates: Optional[str] = typer.Option(None, help="Templates path/dir (optional)"),
+    severity: str = typer.Option("low,medium,high,critical", help="Severity filter (comma-separated)"),
+    include_info: bool = typer.Option(False, help="Include info findings"),
+    rate_limit: int = typer.Option(50, help="Rate limit (-rl)"),
+    concurrency: int = typer.Option(10, help="Concurrency (-c)"),
+    timeout: int = typer.Option(10, help="Per-request timeout (seconds)"),
+    only_interesting_urls: bool = typer.Option(True, help="When mode includes urls, scan only high-signal URL paths"),
+    nuclei_bin: str = typer.Option("nuclei", help="Path to nuclei binary"),
+):
+    """Run change-based nuclei execution and store summarized findings in DB."""
+    from recon.pipeline.nuclei_scan import run_nuclei_scan
+
+    run_nuclei_scan(
+        program=program,
+        mode=mode,
+        since=since,
+        templates=templates,
+        tags=tags,
+        severity=severity,
+        include_info=include_info,
+        rate_limit=rate_limit,
+        concurrency=concurrency,
+        timeout=timeout,
+        only_interesting_urls=only_interesting_urls,
+        nuclei_bin=nuclei_bin,
+    )
 
 if __name__ == "__main__":
     app()

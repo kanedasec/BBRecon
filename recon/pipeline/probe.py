@@ -27,13 +27,13 @@ def normalize_targets(targets: Iterable[str]) -> list[str]:
     return out
 
 
-def probe_targets(targets: list[str]) -> list[dict]:
+def probe_targets(targets: list[str], threads: int = 200, timeout: int = 5, retries: int = 1) -> list[dict]:
     targets = normalize_targets(targets)
     if not targets:
         print("[PROBE] No targets to probe")
         return []
 
-    print(f"[PROBE] httpx: probing {len(targets)} targets (via -u...)")
+    print(f"[PROBE] httpx: probing {len(targets)} targets (via stdin -l /dev/stdin)")
 
     cmd = [
         "httpx",
@@ -41,12 +41,14 @@ def probe_targets(targets: list[str]) -> list[dict]:
         "-json",
         "-include-chain",
         "-follow-redirects",
+        "-threads", str(threads),
+        "-timeout", str(timeout),
+        "-retries", str(retries),
+        "-l", "/dev/stdin",
     ]
 
-    for t in targets:
-        cmd.extend(["-u", t])
-
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    stdin_text = "\n".join(targets) + "\n"
+    r = subprocess.run(cmd, input=stdin_text, capture_output=True, text=True)
 
     if r.returncode != 0:
         err = (r.stderr or "").strip()
